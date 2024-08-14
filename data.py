@@ -110,30 +110,31 @@ class MovieDataProcessor:
 
     def process_data_kge(self):
         movies_df, ratings_df = self.read_tmdb_movies()
-        
+    
         # Create entity mappings
         user_mapping = {user_id: idx for idx, user_id in enumerate(ratings_df['userId'].unique())}
         movie_mapping = {movie_id: idx + len(user_mapping) for idx, movie_id in enumerate(movies_df['movieId'].unique())}
-        
+    
         # Create edge index
         user_indices = torch.tensor([user_mapping[user] for user in ratings_df['userId']], dtype=torch.long)
         movie_indices = torch.tensor([movie_mapping[movie] for movie in ratings_df['movieId']], dtype=torch.long)
         edge_index = torch.stack([user_indices, movie_indices], dim=0)
-
-        # Create edge type (all 0 for 'rates' relation)
-        edge_type = torch.zeros(edge_index.size(1), dtype=torch.long)
-
-        assert len(user_indices) == len(movie_indices)
-        assert len(edge_type) == len(movie_indices)
-
+    
+        # Create edge type based on ratings
+        # Ratings are from 0.5 to 5.0 with 0.5 step, so we have 10 distinct values
+        ratings = ratings_df['rating'].values
+        edge_type = torch.tensor((ratings * 2 - 1).astype(int), dtype=torch.long)
+    
+        assert len(user_indices) == len(movie_indices) == len(edge_type)
+        assert edge_type.max() == 9 and edge_type.min() == 0, "Edge types should be between 0 and 9"
+    
         # Create Data object
         data = Data(
             edge_index=edge_index,
             edge_type=edge_type,
             num_nodes=len(user_mapping) + len(movie_mapping),
-            num_edge_types=1
+            num_edge_types=10  # We now have 10 possible ratings
         )
-
         return data
 
     def prepare_data_kge(self):
