@@ -1,7 +1,7 @@
 import torch
 import pandas as pd
 import torch_geometric.transforms as T
-from torch_geometric.data import HeteroData
+from torch_geometric.data import HeteroData, Data
 from torch_geometric.loader import LinkNeighborLoader
 
 class MovieDataProcessor:
@@ -108,6 +108,66 @@ class MovieDataProcessor:
         
         return data, train_data, val_data, test_data
 
+    def process_data_kge(self):
+        movies_df, ratings_df = self.read_tmdb_movies()
+        
+        # Create entity mappings
+        user_mapping = {user_id: idx for idx, user_id in enumerate(ratings_df['userId'].unique())}
+        movie_mapping = {movie_id: idx + len(user_mapping) for idx, movie_id in enumerate(movies_df['movieId'].unique())}
+        
+        # Create edge index
+        user_indices = torch.tensor([user_mapping[user] for user in ratings_df['userId']], dtype=torch.long)
+        movie_indices = torch.tensor([movie_mapping[movie] for movie in ratings_df['movieId']], dtype=torch.long)
+        edge_index = torch.stack([user_indices, movie_indices], dim=0)
+
+        # Create edge type (all 0 for 'rates' relation)
+        edge_type = torch.zeros(edge_index.size(1), dtype=torch.long)
+
+        assert len(user_indices) == len(movie_indices)
+        assert len(edge_type) == len(movie_indices)
+
+        # Create Data object
+        data = Data(
+            edge_index=edge_index,
+            edge_type=edge_type,
+            num_nodes=len(user_mapping) + len(movie_mapping),
+            num_edge_types=1
+        )
+
+        return data
+
+    def prepare_data_kge(self):
+        data = self.process_data_kge()
+        
+        # Split data
+        num_edges = data.edge_index.size(1)
+        perm = torch.randperm(num_edges)
+        train_edges = int(0.8 * num_edges)
+        val_edges = int(0.1 * num_edges)
+
+        train_data = Data(
+            edge_index=data.edge_index[:, perm[:train_edges]],
+            edge_type=data.edge_type[perm[:train_edges]],
+            num_nodes=data.num_nodes,
+            num_edge_types=data.num_edge_types
+        )
+
+        val_data = Data(
+            edge_index=data.edge_index[:, perm[train_edges:train_edges+val_edges]],
+            edge_type=data.edge_type[perm[train_edges:train_edges+val_edges]],
+            num_nodes=data.num_nodes,
+            num_edge_types=data.num_edge_types
+        )
+
+        test_data = Data(
+            edge_index=data.edge_index[:, perm[train_edges+val_edges:]],
+            edge_type=data.edge_type[perm[train_edges+val_edges:]],
+            num_nodes=data.num_nodes,
+            num_edge_types=data.num_edge_types
+        )
+
+        return train_data, val_data, test_data
+    
     def create_loaders(self, train_data, val_data):
         train_loader = LinkNeighborLoader(
             data=train_data,
@@ -132,8 +192,12 @@ class MovieDataProcessor:
 
         return train_loader, val_loader
 
-def get_movie_data_and_loaders():
+def get_sageconv_movie_data_and_loaders():
     processor = MovieDataProcessor()
     data, train_data, val_data, _ = processor.prepare_data()
     train_loader, val_loader = processor.create_loaders(train_data, val_data)
     return data, train_loader, val_loader
+
+def get_movie_data_kge():
+    processor = MovieDataProcessor()
+    return processor.prepare_data_kge()

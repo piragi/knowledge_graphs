@@ -1,8 +1,6 @@
 import torch
 torch.manual_seed(500)
 from torch import Tensor, nn
-import pandas as pd
-import numpy as np
 from torch_geometric.nn import to_hetero, SAGEConv
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -10,7 +8,6 @@ from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 from typing import List, Tuple
 from torch_geometric.data import HeteroData
-import torch_geometric.transforms as T
 from datetime import datetime
 from data import get_movie_data_and_loaders
 
