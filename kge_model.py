@@ -1,7 +1,6 @@
 import torch
 import torch.optim as optim
 from torch_geometric.nn import TransE
-from torch_geometric.loader import DataLoader
 from data import get_movie_data_kge
 from tqdm import tqdm
 import numpy as np

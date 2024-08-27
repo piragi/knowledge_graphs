@@ -1,27 +1,29 @@
 import torch
+import torch
 import pandas as pd
 import torch_geometric.transforms as T
 from torch_geometric.data import HeteroData, Data
 from torch_geometric.loader import LinkNeighborLoader
 
 class MovieDataProcessor:
-    def __init__(self):
+    def __init__(self, small=False):
         torch.manual_seed(500)
+        self.path = './data/small' if small else './data'
 
     def read_tmdb_movies(self):
         columns_of_interest = ['budget', 'revenue', 'vote_average', 'vote_count', 'production_companies', 'id']
-        movies_df = pd.read_csv("./data/tmdb_5000_movies.csv", usecols=columns_of_interest)
+        movies_df = pd.read_csv(f"./data/tmdb_5000_movies.csv", usecols=columns_of_interest)
         movies_df.fillna({
             'budget': 0,
             'revenue': 0,
             'vote_count': 0,
             'production_companies': ''
         })
-        links_df = pd.read_csv("./data/links.csv", usecols=['movieId', 'tmdbId'])
+        links_df = pd.read_csv(f"{self.path}/links.csv", usecols=['movieId', 'tmdbId'])
         movies_linked_df = pd.merge(movies_df, links_df, left_on='id', right_on='tmdbId', how='inner')
-        movies_info_df = pd.read_csv("./data/movies.csv")
+        movies_info_df = pd.read_csv(f"{self.path}/movies.csv")
         movies_df = pd.merge(movies_linked_df, movies_info_df, on='movieId', how='inner')
-        ratings_df = pd.read_csv("./data/ratings.csv")
+        ratings_df = pd.read_csv(f"{self.path}/ratings.csv")
         ratings_df = ratings_df[ratings_df['movieId'].isin(movies_df['movieId'])]
         return movies_df, ratings_df
 
@@ -82,12 +84,10 @@ class MovieDataProcessor:
         
         # Add node features
         data['movie'].x = movie_feat
+
+        # Create a single edge type with rating as edge attribute
         data['user', 'rates', 'movie'].edge_index = edge_index_user_to_movie
-        data['user', 'rates', 'movie'].edge_label = torch.from_numpy(ratings_df['rating'].values).to(torch.long)
-        
-        mask = data['user', 'rates', 'movie'].edge_label >= 4
-        del data['user', 'rates', 'movie'].edge_label 
-        data['user', 'rates', 'movie'].edge_index = data['user', 'rates', 'movie'].edge_index[:, mask]
+        data['user', 'rates', 'movie'].edge_attr = torch.from_numpy(ratings_df['rating'].values).float().unsqueeze(1)
         
         return data
 
@@ -101,12 +101,12 @@ class MovieDataProcessor:
             disjoint_train_ratio=0.3,
             neg_sampling_ratio=2.0,
             add_negative_train_samples=False,
-            edge_types=[("user", "rates", "movie")],
-            rev_edge_types=[("movie", "rev_rates", "user")],
+            edge_types=[('user', 'rates', 'movie')],
+            rev_edge_types=[('movie', 'rev_rates', 'user')],
         )
         train_data, val_data, test_data = transform(data)
         
-        return data, train_data, val_data, test_data
+        return data, train_data, val_data, test_data    
 
     def process_data_kge(self):
         movies_df, ratings_df = self.read_tmdb_movies()
@@ -193,12 +193,12 @@ class MovieDataProcessor:
 
         return train_loader, val_loader
 
-def get_sageconv_movie_data_and_loaders():
-    processor = MovieDataProcessor()
+def get_sageconv_movie_data_and_loaders(small=False):
+    processor = MovieDataProcessor(small)
     data, train_data, val_data, _ = processor.prepare_data()
     train_loader, val_loader = processor.create_loaders(train_data, val_data)
     return data, train_loader, val_loader
 
-def get_movie_data_kge():
-    processor = MovieDataProcessor()
+def get_movie_data_kge(small=False):
+    processor = MovieDataProcessor(small)
     return processor.prepare_data_kge()
