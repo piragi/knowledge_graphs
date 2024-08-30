@@ -75,7 +75,6 @@ class MovieDataProcessor:
 
         edge_index_user_to_movie = torch.stack([ratings_user_id, ratings_movie_id], dim=0)
 
-        # New rating grouping
         def group_ratings(rating):
             if pd.isna(rating) or rating <= 1.0:
                 return 0  # Low (including any remaining NaN or undefined values)
@@ -110,8 +109,8 @@ class MovieDataProcessor:
         data['user', 'rates', 'movie'].edge_index = edge_index_user_to_movie
 
         grouped_ratings = torch.from_numpy(ratings_df['grouped_rating'].values).long()
-        # one_hot_ratings = F.one_hot(grouped_ratings, num_classes=7).float()
-        # data['user', 'rates', 'movie'].edge_attr = one_hot_ratings
+        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=7).float()
+        data['user', 'rates', 'movie'].edge_attr = one_hot_ratings
         data['user', 'rates', 'movie'].edge_label = grouped_ratings
 
         data = T.ToUndirected()(data)
@@ -155,6 +154,7 @@ class MovieDataProcessor:
 #            print(torch.argmax(train_data['user', 'rates', 'movie'].edge_attr[edge.input_id[0]], dim=0))
 #            print('------')
 
+        print(train_data)
         return train_data, train_loader, val_loader, test_loader
 
     def process_data_kge(self):
