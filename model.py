@@ -11,6 +11,8 @@ from typing import List, Tuple
 from torch_geometric.data import HeteroData
 from datetime import datetime
 from data import get_sageconv_movie_data_and_loaders
+from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score
 
 class EdgeSAGEConv(SAGEConv):
     def __init__(self, *args, edge_dim=0, **kwargs):
@@ -46,17 +48,17 @@ class GNN(nn.Module):
 
 class Classifier(nn.Module):
     """Classifier for link prediction."""
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, num_classes: int = 7):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(2*hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, num_classes)
         )
     
     def forward(self, user_features: Tensor, movie_features: Tensor, edge_index: Tensor) -> Tensor:
         edge_features = torch.cat([user_features[edge_index[0]], movie_features[edge_index[1]]], dim=1)
-        return self.layers(edge_features).view(-1)
+        return self.layers(edge_features)
 
 class RecommendationModel(nn.Module):
     """Main model for movie recommendations."""
@@ -76,118 +78,124 @@ class RecommendationModel(nn.Module):
             "movie": self.movie_lin(data['movie'].x) + self.movie_emb(data['movie'].node_id),
         }
         x_dict = self.gnn(x_dict, data.edge_index_dict, data.edge_attr_dict)
-        
+
         return self.classifier(
             x_dict["user"],
             x_dict["movie"],
-            data["user", "rates", "movie"].edge_label_index,
+            data["user", "rates", "movie"].edge_index,
         )
 
-def generate_simple_filename(auc, small=False):
-    """
-    Generate a simple filename for saving the model.
-    
-    Args:
-    auc (float): The AUC score of the model.
-    
-    Returns:
-    str: A formatted filename string.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    auc_str = f"{auc:.4f}".replace('.', '')
-    filename = f"model_{timestamp}_auc{auc_str}_small.pt" if small else f"model_{timestamp}_auc{auc_str}.pt"
-    
-    return filename
-
-def train_epoch(model: torch.nn.Module, 
-                loader: torch.utils.data.DataLoader, 
+def train_epoch(model: nn.Module, 
+                loader: DataLoader, 
                 optimizer: torch.optim.Optimizer, 
+                criterion: nn.Module,
                 device: torch.device) -> float:
     model.train()
     total_loss = 0
-    total_examples = 0
-    
     for batch in tqdm(loader, desc="Training"):
         batch = batch.to(device)
         optimizer.zero_grad()
         pred = model(batch)
-        label = batch['user', 'rates', 'movie'].edge_label
-        loss = F.binary_cross_entropy_with_logits(pred, label)
+        labels = batch['user', 'rates', 'movie'].edge_attr.argmax(dim=1)
+        loss = criterion(pred, labels)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * label.numel()
-        total_examples += label.numel()
-    
-    return total_loss / total_examples
+        total_loss += loss.item() * labels.numel()
+    return total_loss / len(loader.dataset)
 
-def validate(model: torch.nn.Module, 
-             loader: torch.utils.data.DataLoader, 
-             device: torch.device):
+def validate(model: nn.Module, 
+             loader: DataLoader, 
+             criterion: nn.Module,
+             device: torch.device) -> Tuple[float, float]:
     model.eval()
-    preds = []
-    ground_truths = []
-    
+    total_loss = 0
+    all_preds, all_labels = [], []
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validating"):
             batch = batch.to(device)
             pred = model(batch)
-            preds.append(pred)
-            ground_truths.append(batch["user", "rates", "movie"].edge_label)
-    
-    pred = torch.cat(preds, dim=0).cpu().numpy()
-    ground_truth = torch.cat(ground_truths, dim=0).cpu().numpy()
-    auc = roc_auc_score(ground_truth, pred)
-    
-    return auc, pred.tolist(), ground_truth.tolist()
+            labels = batch['user', 'rates', 'movie'].edge_attr.argmax(dim=1)
+            loss = criterion(pred, labels)
+            total_loss += loss.item() * labels.numel()
+            all_preds.append(F.softmax(pred, dim=1).cpu())
+            all_labels.append(labels.cpu())
+    preds = torch.cat(all_preds, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    print(labels[:10])
+    print(preds.argmax(dim=1)[:10])
+    return total_loss / len(loader.dataset), compute_accuracy(labels, preds)
 
-def train_model(model: torch.nn.Module, 
-                train_loader: torch.utils.data.DataLoader, 
-                val_loader: torch.utils.data.DataLoader, 
-                num_epochs: int = 150, 
-                lr: float = 0.001, 
-                device_name: str = "cuda" if torch.cuda.is_available() else "cpu", 
-                save_path: str = "./model",
-                small: bool = False) -> Tuple[List[float], List[float]]:
-    print(f'Device: {device_name}')
-    device = torch.device(device_name)
+def compute_accuracy(labels: torch.Tensor, preds: torch.Tensor) -> float:
+    """Compute accuracy for multi-class classification."""
+    return accuracy_score(labels.numpy(), preds.argmax(dim=1).numpy())
+
+def save_model(model: nn.Module, 
+               accuracy: float, 
+               save_path: str):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"model_{timestamp}_acc{accuracy:.4f}.pt"
+    torch.save(model.state_dict(), f"{save_path}/{filename}")
+    print(f"Model saved: {filename}")
+
+def train_gnn(model: nn.Module,
+              train_loader: DataLoader,
+              val_loader: DataLoader,
+              num_epochs: int = 15,
+              lr: float = 0.0001,
+              save_path: str = "./model") -> Tuple[nn.Module, List[float], List[float]]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f'Device: {device}')
+
     model = model.to(device)
-    optimizer = Adam(model.parameters(), lr=lr)
-    
-    train_losses = []
-    val_aucs = []
-    
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()  # Changed to CrossEntropyLoss for multi-class classification
+    best_accuracy = float('-inf')
+    train_losses, val_accuracies = [], []
+
     for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device)
-        val_auc, _, _ = validate(model, val_loader, device)
-        
+        # Training
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         train_losses.append(train_loss)
-        val_aucs.append(val_auc)
-        
-        print(f'Epoch {epoch + 1:03d}, Loss: {train_loss:.4f}, Validation AUC: {val_auc:.4f}')
-        
-        if val_auc == max(val_aucs):
-            filename = generate_simple_filename(val_auc, small)
-            torch.save(model.state_dict(), f"{save_path}/{filename}")
 
-    
-    return train_losses, val_aucs
+        # Validation
+        val_loss, val_accuracy = validate(model, val_loader, criterion, device)
+        val_accuracies.append(val_accuracy)
 
-config = {
-    'movie_feature_dim': 24,
-    'hidden_dim': 64,
-    'num_layers': 2,
-    'edge_dim': 1,
-}
+        print(f'Epoch {epoch + 1:03d}, Loss: {train_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
 
-small_data = True
+        # Save best model
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            # save_model(model, val_accuracy, save_path)
 
-# Usage
-num_epochs = 30
-learning_rate = 0.001
-data, train_loader, val_loader = get_sageconv_movie_data_and_loaders(small_data)
+    return model, train_losses, val_accuracies
 
-model = RecommendationModel(config, data)
-train_losses, val_aucs = train_model(model, train_loader, val_loader, 
-                                     num_epochs=num_epochs, 
-                                     lr=learning_rate,
-                                     small=small_data)
+def print_rating_distribution(data):
+    ratings = data['user', 'rates', 'movie'].edge_attr.argmax(dim=1)
+    unique, counts = torch.unique(ratings, return_counts=True)
+    total = counts.sum().item()
+    print("Rating distribution:")
+    for rating, count in zip(unique.tolist(), counts.tolist()):
+        percentage = count / total * 100
+        print(f"Rating {rating/2:.1f}: {count} ({percentage:.2f}%)")
+
+def main():
+    config = {
+        'movie_feature_dim': 24,
+        'hidden_dim': 1024,
+        'num_layers': 1,
+        'edge_dim': 7,
+        'learning_rate': 0.001,
+        'epochs': 35,
+    }
+
+    data, train_loader, val_loader, test_loader = get_sageconv_movie_data_and_loaders(small=True)
+    print_rating_distribution(data)
+    model = RecommendationModel(config, data)
+
+    trained_model, losses, accuracies = train_gnn(model, train_loader, val_loader, num_epochs=config['epochs'], lr=config['learning_rate'])
+    return trained_model, losses, accuracies
+
+if __name__ == "__main__":
+    main()
+

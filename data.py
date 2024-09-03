@@ -1,3 +1,4 @@
+from collections import defaultdict
 import torch
 import sys
 import torch.nn.functional as F
@@ -5,6 +6,7 @@ import pandas as pd
 import torch_geometric.transforms as T
 from torch_geometric.data import HeteroData, Data, RandomNodeLoader
 from torch_geometric.loader import LinkNeighborLoader, NeighborLoader
+import analyze
 
 class MovieDataProcessor:
     def __init__(self, small=False):
@@ -32,19 +34,81 @@ class MovieDataProcessor:
     def standardize(x):
         return (x - x.mean()) / x.std()
 
-    def process_data(self):
-        movies_df, ratings_df = self.read_tmdb_movies()
+    
+    def split_user_ratings(self, ratings_df, train_ratio=0.8):
+        # Convert timestamp to datetime if it's not already
+        ratings_df['timestamp'] = pd.to_datetime(ratings_df['timestamp'], unit='s')
+        
+        # Sort ratings by timestamp for each user
+        ratings_df = ratings_df.sort_values(['userId', 'timestamp'])
+        
+        # Group by user and split
+        train_ratings = ratings_df.groupby('userId').apply(lambda x: x.iloc[:int(len(x) * train_ratio)]).reset_index(drop=True)
+        test_ratings = ratings_df[~ratings_df.index.isin(train_ratings.index)]
+        
+        return train_ratings, test_ratings
 
-        # Remove entries with null or undefined ratings
-        ratings_df = ratings_df.dropna(subset=['rating'])
+    def generate_user_features(self, ratings_df, movies_df):
+        merged_df = ratings_df.merge(movies_df, on='movieId')
+        user_avg_rating = merged_df.groupby('userId')['rating'].mean()
 
-        # Filter movies based on ratings
+        genre_dummies = merged_df['genres'].str.get_dummies('|')
+        genre_preference = merged_df.apply(lambda row: row['rating'] * genre_dummies.loc[row.name], axis=1)
+        user_genre_preference = genre_preference.groupby(merged_df['userId']).sum()
+        user_genre_preference = user_genre_preference.div(user_genre_preference.sum(axis=1), axis=0)
+
+        # Compute other preferences
+        preferences = ['budget', 'revenue', 'vote_count']
+        user_preferences = merged_df.groupby('userId').apply(lambda x: pd.Series({
+            f'{pref}_preference': (x['rating'] * x[pref]).sum() / x['rating'].sum()
+            for pref in preferences
+        }))
+
+        # Combine all features
+        user_features = pd.concat([
+            user_avg_rating.rename('avg_rating'),
+            user_genre_preference,
+            user_preferences
+        ], axis=1).fillna(0)
+
+        # Normalize non-genre features
+        non_genre_columns = ['avg_rating'] + [f'{pref}_preference' for pref in preferences]
+        user_features[non_genre_columns] = (user_features[non_genre_columns] - user_features[non_genre_columns].mean()) / user_features[non_genre_columns].std()
+        
+        return user_features  # Return DataFrame with userId as index
+
+    def apply_user_features(self, test_ratings_df, train_user_features):
+        # Get unique users in the test set
+        test_users = test_ratings_df['userId'].unique()
+        
+        # Create a DataFrame for test user features
+        test_user_features = pd.DataFrame(index=test_users, columns=train_user_features.columns)
+        
+        # Fill in features for users that exist in the training set
+        common_users = test_user_features.index.intersection(train_user_features.index)
+        test_user_features.loc[common_users] = train_user_features.loc[common_users]
+        
+        # For new users, use the mean of the training features
+        new_users = test_user_features.index.difference(train_user_features.index)
+        mean_features = train_user_features.mean()
+        
+        # Only set mean features if there are new users
+        if len(new_users) > 0:
+            test_user_features.loc[new_users] = mean_features
+        
+        # Add a flag for new users
+        test_user_features['is_new_user'] = 0
+        if len(new_users) > 0:
+            test_user_features.loc[new_users, 'is_new_user'] = 1
+        
+        # Fill NaN values with 0 (in case any remain)
+        test_user_features = test_user_features.fillna(0)
+        
+        return test_user_features
+
+    def generate_movie_features(self, movies_df, ratings_df):
         movies_df = movies_df[movies_df['movieId'].isin(ratings_df['movieId'])]
-
-        # Process genres
         genres = movies_df['genres'].str.get_dummies('|')
-
-        # Process numerical features
         numerical_features = ['vote_average', 'revenue', 'budget', 'vote_count']
         movies_df['vote_average'] = movies_df['vote_average'].fillna(5.0)
 
@@ -52,9 +116,11 @@ class MovieDataProcessor:
         num_features = movies_df[numerical_features].values.astype(float)
         num_features_standardized = self.standardize(num_features)
         num_tensors = torch.from_numpy(num_features_standardized).float()
+        return torch.cat([torch.from_numpy(genres.values).float(), num_tensors], dim=1)
 
-        # Combine all features
-        movie_feat = torch.cat([torch.from_numpy(genres.values).float(), num_tensors], dim=1)
+    def process_data(self, ratings_df):
+        ratings_df = ratings_df.dropna(subset=['rating'])
+        # self.analyze_user_data(ratings_df, movies_df) 
 
         # Construct a compact representation of the data
         unique_user_id = ratings_df['userId'].unique()
@@ -90,22 +156,17 @@ class MovieDataProcessor:
                 return 5  # Excellent
 
         ratings_df['grouped_rating'] = ratings_df['rating'].apply(group_ratings)
+        return edge_index_user_to_movie, ratings_df, unique_user_id, unique_movie_id
 
-        return movie_feat, edge_index_user_to_movie, ratings_df, unique_user_id, unique_movie_id
-
-    def create_hetero_data(self):
-        movie_feat, edge_index_user_to_movie, ratings_df, unique_user_id, unique_movie_id = self.process_data()
-
+    def create_hetero_data(self, ratings_df, movies_df, edge_index_user_to_movie, unique_user_id, unique_movie_id, user_features=None):
         data = HeteroData()
 
-        # Save node indices
         data['user'].node_id = torch.arange(len(unique_user_id))
         data['movie'].node_id = torch.arange(len(unique_movie_id))
 
-        # Add node features
-        data['movie'].x = movie_feat
+        data['movie'].x = self.generate_movie_features(movies_df, ratings_df)
+        # data['user'].x = torch.tensor(user_features.values, dtype=torch.float)
 
-        # Create a single edge type with rating as edge attribute
         data['user', 'rates', 'movie'].edge_index = edge_index_user_to_movie
 
         grouped_ratings = torch.from_numpy(ratings_df['grouped_rating'].values).long()
@@ -116,11 +177,9 @@ class MovieDataProcessor:
         data = T.ToUndirected()(data)
         return data
 
-    def prepare_data(self, batch_size=2048, num_neighbors=[10, 5]):
-        data = self.create_hetero_data()
-        
+    def generate_loaders(self, train_data, batch_size=1024, num_neighbors=[5,5]):
         transform = T.RandomLinkSplit(
-            num_val=0.1,
+            num_val=0.2,
             num_test=0.1,
             disjoint_train_ratio=0.3,
             neg_sampling_ratio=2.0,
@@ -129,33 +188,18 @@ class MovieDataProcessor:
             rev_edge_types=("movie", "rev_rates", "user"),
             key='edge_label',
         )
-        train_data, val_data, test_data = transform(data)
-        
-        create_loader = lambda data, shuffle=False, batch_size=2048, neg_sampling_ratio=0.0: LinkNeighborLoader(data, num_neighbors=num_neighbors, batch_size=batch_size, shuffle=shuffle,
+        train_data, val_data, test_data = transform(train_data)
+
+        create_loader = lambda data, batch_size=batch_size, shuffle=False, neg_sampling_ratio=0.0: LinkNeighborLoader(data, num_neighbors=num_neighbors, batch_size=batch_size, shuffle=shuffle,
                                                         neg_sampling_ratio=neg_sampling_ratio,
                                                         edge_label_index=(('user', 'rates', 'movie'), data['user','rates', 'movie'].edge_label_index), 
                                                         edge_label= data['user', 'rates', 'movie'].edge_label)#torch.argmax(data['user', 'rates', 'movie'].edge_attr, dim=1))
+
         train_loader = create_loader(train_data, shuffle=True, neg_sampling_ratio=2.0)
         val_loader = create_loader(val_data, batch_size=2048*3)
         test_loader = create_loader(test_data)
 
-#        print(train_data)
-#        print(train_data['user', 'rates', 'movie'].edge_index)
-#        print(torch.argmax(train_data['user', 'rates', 'movie'].edge_attr, dim=1))
-#        for batch in train_loader:
-#            edge = batch['user', 'rates', 'movie']
-#            #print(batch)
-#            print(f'edge.edge_label_index={edge.edge_label_index}')
-#            print(f'edge.edge_label={edge.edge_label}')
-#            print(torch.argmax(edge.edge_attr, dim=1))
-#            print(edge.input_id[0])
-#            print(train_data['user', 'rates', 'movie'].edge_index.T[edge.input_id[0]])
-#            print('-----')
-#            print(torch.argmax(train_data['user', 'rates', 'movie'].edge_attr[edge.input_id[0]], dim=0))
-#            print('------')
-
-        print(train_data)
-        return train_data, train_loader, val_loader, test_loader
+        return train_loader, val_loader, test_loader
 
     def process_data_kge(self):
         movies_df, ratings_df = self.read_tmdb_movies()
@@ -218,35 +262,15 @@ class MovieDataProcessor:
 
         return train_data, val_data, test_data
     
-    def create_loaders(self, train_data, val_data):
-        train_loader = LinkNeighborLoader(
-            data=train_data,
-            num_neighbors=[10, 10, 10],
-            edge_label_index=(('user', 'rates', 'movie'), train_data['user', 'rates', 'movie'].edge_label_index),
-            edge_label=train_data['user', 'rates', 'movie'].edge_label,
-            batch_size=128,
-            shuffle=True,
-            neg_sampling_ratio=2.0
-        )
-
-        edge_label_index = val_data["user", "rates", "movie"].edge_label_index
-        edge_label = val_data["user", "rates", "movie"].edge_label
-        val_loader = LinkNeighborLoader(
-            data=val_data,
-            num_neighbors=[10, 10, 10],
-            edge_label_index=(("user", "rates", "movie"), edge_label_index),
-            edge_label=edge_label,
-            batch_size=128*3,
-            shuffle=False,
-        )
-
-        return train_loader, val_loader
-
 def get_sageconv_movie_data_and_loaders(small=False):
     processor = MovieDataProcessor(small)
-    train_data, train_loader, val_loader, test_loader = processor.prepare_data()
+    movies_df, ratings_df = processor.read_tmdb_movies() 
+    edge_index_user_to_movie, train_ratings_df, unique_user_id, unique_movie_id = processor.process_data(ratings_df)
+    train_data = processor.create_hetero_data(train_ratings_df, movies_df, edge_index_user_to_movie, unique_user_id, unique_movie_id) 
+    train_loader, val_loader, test_loader = processor.generate_loaders(train_data)
     return train_data, train_loader, val_loader, test_loader
 
 def get_movie_data_kge(small=False):
     processor = MovieDataProcessor(small)
     return processor.prepare_data_kge()
+

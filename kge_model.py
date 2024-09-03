@@ -116,3 +116,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def train_kge_model():
+    train_data, val_data, test_data = get_movie_data_kge(small=True)
+    model = MovieRecommendationModel(train_data.num_nodes, train_data.num_edge_types)
+    
+    train_loader = model.create_loader(train_data)
+    val_loader = model.create_loader(val_data)
+
+    num_epochs = 2
+    for epoch in range(1, num_epochs + 1):
+        loss = model.train_epoch(train_loader)
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}')
+        if epoch % 5 == 0:
+            val_loss = model.evaluate(val_loader)
+            val_auc = model.compute_auc(val_data.edge_index, val_data.edge_type)
+            print(f'Epoch: {epoch:03d}, Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}')
+        print(f'GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}GB')
+
+    test_auc = model.compute_auc(test_data.edge_index, test_data.edge_type)
+    print(f'Test AUC: {test_auc:.4f}')
+    return model
