@@ -2,7 +2,7 @@ import torch
 import torch.utils.data
 torch.manual_seed(500)
 from torch import Tensor, nn
-from torch_geometric.nn import to_hetero, SAGEConv
+from torch_geometric.nn import to_hetero, SAGEConv, GATConv
 import torch.nn.functional as F
 from torch.optim import Adam
 from sklearn.metrics import roc_auc_score
@@ -13,6 +13,33 @@ from datetime import datetime
 from data import get_sageconv_movie_data_and_loaders
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score
+
+class GAT(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, heads, edge_dim):
+        super().__init__()
+        self.num_layers = num_layers
+
+        self.convs = torch.nn.ModuleList()
+        self.skips = torch.nn.ModuleList()
+
+        self.convs.append(GATConv(in_channels, hidden_channels, heads, edge_dim=edge_dim, add_self_loops=False))
+        self.skips.append(nn.Linear(in_channels, hidden_channels * heads))
+
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(heads * hidden_channels, hidden_channels, heads, edge_dim=edge_dim, add_self_loops=False))
+            self.skips.append(nn.Linear(hidden_channels * heads, hidden_channels * heads))
+
+        self.convs.append(GATConv(heads * hidden_channels, out_channels, heads, concat=False, edge_dim=edge_dim, add_self_loops=False))
+        self.skips.append(nn.Linear(hidden_channels * heads, out_channels))
+
+    def forward(self, x, edge_index, edge_attr):
+        for i, (conv, skip) in enumerate(zip(self.convs, self.skips)): 
+            x = conv(x, edge_index, edge_attr) + skip(x) #TODO: we would also get a alpha (the attention out of it) and could use that in the next pass as edge_attr
+            #TODO: like this: edge_attr = alpha 
+            if i != self.num_layers - 1:
+                x = F.elu(x)
+                x = F.dropout(x, p=0.5, training=self.training)
+        return x
 
 class EdgeSAGEConv(SAGEConv):
     def __init__(self, *args, edge_dim=0, **kwargs):
@@ -62,13 +89,17 @@ class Classifier(nn.Module):
 
 class RecommendationModel(nn.Module):
     """Main model for movie recommendations."""
-    def __init__(self, config: dict, data: HeteroData):
+    def __init__(self, config: dict, data: HeteroData, type):
         super().__init__()
         self.movie_lin = nn.Linear(config['movie_feature_dim'], config['hidden_dim'])
         self.user_emb = nn.Embedding(data['user'].num_nodes, config['hidden_dim'])
         self.movie_emb = nn.Embedding(data['movie'].num_nodes, config['hidden_dim'])
-        self.gnn = GNN(config['hidden_dim'], config['hidden_dim'], config['num_layers'], edge_dim=config['edge_dim'])
-        self.gnn = to_hetero(self.gnn, metadata=data.metadata(), aggr='sum')
+        if type == 'gnn':
+            self.conv = GNN(config['hidden_dim'], config['hidden_dim'], config['num_layers'], edge_dim=config['edge_dim'])
+        if type == 'gat':
+            self.conv = GAT(config['hidden_dim'], config['hidden_dim'], config['hidden_dim'] , config['num_layers'], config['num_heads'], config['edge_dim'])
+        self.conv = to_hetero(self.conv, data.metadata(), aggr="sum")
+
         
         self.classifier = Classifier(config['hidden_dim'])
     
@@ -77,7 +108,7 @@ class RecommendationModel(nn.Module):
             "user": self.user_emb(data['user'].node_id),
             "movie": self.movie_lin(data['movie'].x) + self.movie_emb(data['movie'].node_id),
         }
-        x_dict = self.gnn(x_dict, data.edge_index_dict, data.edge_attr_dict)
+        x_dict = self.conv(x_dict, data.edge_index_dict, data.edge_attr_dict)
 
         return self.classifier(
             x_dict["user"],
@@ -189,11 +220,22 @@ def main():
         'epochs': 35,
     }
 
+    config_gat = {
+        'movie_feature_dim': 24,
+        'hidden_dim': 2048,
+        'num_layers': 2,
+        'num_heads': 2,
+        'edge_dim': 7,
+        'learning_rate': 0.0001,
+        'epochs': 55,
+    }
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     data, train_loader, val_loader, test_loader = get_sageconv_movie_data_and_loaders(small=True)
     print_rating_distribution(data)
-    model = RecommendationModel(config, data)
+    model = RecommendationModel(config_gat, data, 'gat').to(device)
 
-    trained_model, losses, accuracies = train_gnn(model, train_loader, val_loader, num_epochs=config['epochs'], lr=config['learning_rate'])
+    trained_model, losses, accuracies = train_gnn(model, train_loader, val_loader, num_epochs=config_gat['epochs'], lr=config_gat['learning_rate'])
     return trained_model, losses, accuracies
 
 if __name__ == "__main__":

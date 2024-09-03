@@ -177,7 +177,7 @@ class MovieDataProcessor:
         data = T.ToUndirected()(data)
         return data
 
-    def generate_loaders(self, train_data, batch_size=1024, num_neighbors=[5,5]):
+    def generate_loaders(self, train_data, batch_size=2048, num_neighbors=[20,20]):
         transform = T.RandomLinkSplit(
             num_val=0.2,
             num_test=0.1,
