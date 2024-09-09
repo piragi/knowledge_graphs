@@ -141,20 +141,7 @@ class MovieDataProcessor:
 
         edge_index_user_to_movie = torch.stack([ratings_user_id, ratings_movie_id], dim=0)
 
-        def group_ratings(rating):
-            if pd.isna(rating) or rating <= 1.0:
-                return 0  # Low (including any remaining NaN or undefined values)
-            elif rating <= 2.0:
-                return 1  # Below Average
-            elif rating <= 2.5:
-                return 2  # Fair
-            elif rating <= 3.0:
-                return 3  # Average
-            elif rating <= 4.0:
-                return 4  # Good
-            else:
-                return 5  # Excellent
-
+        group_ratings = lambda rating: min(5, max(0, int(rating))) if pd.notna(rating) else 0
         ratings_df['grouped_rating'] = ratings_df['rating'].apply(group_ratings)
         return edge_index_user_to_movie, ratings_df, unique_user_id, unique_movie_id
 
@@ -273,4 +260,3 @@ def get_sageconv_movie_data_and_loaders(small=False):
 def get_movie_data_kge(small=False):
     processor = MovieDataProcessor(small)
     return processor.prepare_data_kge()
-
