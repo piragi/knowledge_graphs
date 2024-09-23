@@ -66,10 +66,7 @@ class GAT(torch.nn.Module):
 
     def forward(self, x, edge_index, edge_attr):
         for i, (conv, skip) in enumerate(zip(self.convs, self.skips)):
-            x = conv(x, edge_index, edge_attr) + skip(
-                x
-            )  # TODO: we would also get a alpha (the attention out of it) and could use that in the next pass as edge_attr
-            # TODO: like this: edge_attr = alpha
+            x = conv(x, edge_index, edge_attr) + skip(x)
             if i != self.num_layers - 1:
                 x = F.elu(x)
                 x = F.dropout(x, p=0.5, training=self.training)
@@ -136,7 +133,11 @@ class RecommendationModel(nn.Module):
     def __init__(self, config: dict, data: HeteroData, type):
         super().__init__()
         self.movie_lin = nn.Linear(config["movie_feature_dim"], config["hidden_dim"])
+        self.genre_emb = nn.Embedding(data["genre"].num_nodes, config["hidden_dim"])
         self.user_emb = nn.Embedding(data["user"].num_nodes, config["hidden_dim"])
+        self.director_emb = nn.Embedding(
+            data["director"].num_nodes, config["hidden_dim"]
+        )
         self.movie_emb = nn.Embedding(data["movie"].num_nodes, config["hidden_dim"])
         self.model_type = type
         if self.model_type == "gnn":
@@ -162,6 +163,8 @@ class RecommendationModel(nn.Module):
     def forward(self, data: HeteroData) -> Tensor:
         x_dict = {
             "user": self.user_emb(data["user"].node_id),
+            "director": self.director_emb(data["director"].node_id),
+            "genre": self.genre_emb(data["genre"].node_id),
             "movie": self.movie_lin(data["movie"].x)
             + self.movie_emb(data["movie"].node_id),
         }
@@ -213,6 +216,16 @@ def validate(
     preds = torch.cat(all_preds, dim=0)
     labels = torch.cat(all_labels, dim=0)
     return total_loss / len(loader.dataset), compute_accuracy(labels, preds)
+
+
+def inference(model: nn.Module, input: HeteroData, device: torch.device):
+    model.eval()
+    with torch.no_grad():
+        input = input.to(device)
+        pred = model(input)
+        probabilities = F.softmax(pred, dim=1)
+        predicted_ratings = probabilities.argmax(dim=1) / 2
+    return probabilities, predicted_ratings
 
 
 def compute_accuracy(labels: torch.Tensor, preds: torch.Tensor) -> float:
@@ -283,6 +296,14 @@ def print_rating_distribution(data):
         print(f"Rating {rating/2:.1f}: {count} ({percentage:.2f}%)")
 
 
+def load_model(model_path: str, config: dict, data, device: torch.device):
+    model = RecommendationModel(config, data, "gat").to(device)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
 def main():
     config = {
         "movie_feature_dim": 24,
@@ -296,14 +317,14 @@ def main():
 
     config_gat = {
         "batch_size": 2048,
-        "movie_feature_dim": 24,
+        "movie_feature_dim": 4,
         "hidden_dim": 256,
         "num_layers": 3,
         "num_heads": 3,
         "edge_dim": 7,
         "learning_rate": 0.0001,
         "epochs": 5,
-        "neighbors": [5, 5],
+        "neighbors": [10, 5, 5],
     }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -311,37 +332,6 @@ def main():
         batch_size=config_gat["batch_size"],
         neighbors=config_gat["neighbors"],
         small=False,
-    )
-    print_rating_distribution(data)
-    model = RecommendationModel(config_gat, data, "gat").to(device)
-
-    trained_model, losses, accuracies = train_gnn(
-        model,
-        train_loader,
-        val_loader,
-        test_loader,
-        num_epochs=config_gat["epochs"],
-        lr=config_gat["learning_rate"],
-    )
-    return trained_model, losses, accuracies
-
-
-def search_hyperparameters():
-    config_gat = {
-        "batch_size": 4096,
-        "movie_feature_dim": 24,
-        "hidden_dim": 256,
-        "num_layers": [1, 2, 3],
-        "num_heads": [1, 2, 3],
-        "edge_dim": 7,
-        "learning_rate": [0.0005, 0.0001, 0.00001],
-        "epochs": 3,
-        "neighbors": [[5, 5], [10, 5], [10, 10]],
-    }
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data, train_loader, val_loader, test_loader = get_sageconv_movie_data_and_loaders(
-        neighbors=config_gat["neighbors"], small=False
     )
     print_rating_distribution(data)
     model = RecommendationModel(config_gat, data, "gat").to(device)
