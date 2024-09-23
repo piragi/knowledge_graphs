@@ -14,8 +14,6 @@ from tqdm import tqdm
 
 from data import get_sageconv_movie_data_and_loaders
 
-# torch.manual_seed(500)
-
 
 class GAT(torch.nn.Module):
     def __init__(
@@ -130,16 +128,24 @@ class Classifier(nn.Module):
 class RecommendationModel(nn.Module):
     """Main model for movie recommendations."""
 
-    def __init__(self, config: dict, data: HeteroData, type):
+    def __init__(self, config: dict, data_info: dict, model_type: str):
         super().__init__()
-        self.movie_lin = nn.Linear(config["movie_feature_dim"], config["hidden_dim"])
-        self.genre_emb = nn.Embedding(data["genre"].num_nodes, config["hidden_dim"])
-        self.user_emb = nn.Embedding(data["user"].num_nodes, config["hidden_dim"])
-        self.director_emb = nn.Embedding(
-            data["director"].num_nodes, config["hidden_dim"]
+        self.config = config
+        self.model_type = model_type
+        self.data_info = data_info
+
+        self.movie_lin = nn.Linear(data_info["movie_feature_dim"], config["hidden_dim"])
+        self.genre_emb = nn.Embedding(
+            data_info["num_genre_nodes"], config["hidden_dim"]
         )
-        self.movie_emb = nn.Embedding(data["movie"].num_nodes, config["hidden_dim"])
-        self.model_type = type
+        self.user_emb = nn.Embedding(data_info["num_user_nodes"], config["hidden_dim"])
+        self.director_emb = nn.Embedding(
+            data_info["num_director_nodes"], config["hidden_dim"]
+        )
+        self.movie_emb = nn.Embedding(
+            data_info["num_movie_nodes"], config["hidden_dim"]
+        )
+
         if self.model_type == "gnn":
             self.conv = GNN(
                 config["hidden_dim"],
@@ -147,7 +153,7 @@ class RecommendationModel(nn.Module):
                 config["num_layers"],
                 edge_dim=config["edge_dim"],
             )
-        if self.model_type == "gat":
+        elif self.model_type == "gat":
             self.conv = GAT(
                 config["hidden_dim"],
                 config["hidden_dim"],
@@ -156,7 +162,7 @@ class RecommendationModel(nn.Module):
                 config["num_heads"],
                 config["edge_dim"],
             )
-        self.conv = to_hetero(self.conv, data.metadata(), aggr="sum")
+        self.conv = to_hetero(self.conv, data_info["metadata"], aggr="sum")
 
         self.classifier = Classifier(config["hidden_dim"])
 
@@ -173,7 +179,7 @@ class RecommendationModel(nn.Module):
         return self.classifier(
             x_dict["user"],
             x_dict["movie"],
-            data["user", "rates", "movie"].edge_index,
+            data["user", "rates", "movie"].edge_label_index,
         )
 
 
@@ -190,7 +196,7 @@ def train_epoch(
         batch = batch.to(device)
         optimizer.zero_grad()
         pred = model(batch)
-        labels = batch["user", "rates", "movie"].edge_attr.argmax(dim=1)
+        labels = batch["user", "rates", "movie"].edge_label
         loss = criterion(pred, labels)
         loss.backward()
         optimizer.step()
@@ -208,36 +214,69 @@ def validate(
         for batch in tqdm(loader, desc="Validating"):
             batch = batch.to(device)
             pred = model(batch)
-            labels = batch["user", "rates", "movie"].edge_attr.argmax(dim=1)
+            labels = batch["user", "rates", "movie"].edge_label
             loss = criterion(pred, labels)
             total_loss += loss.item() * labels.numel()
-            all_preds.append(F.softmax(pred, dim=1).cpu())
-            all_labels.append(labels.cpu())
+            all_preds.append(F.softmax(pred, dim=1))
+            all_labels.append(labels)
     preds = torch.cat(all_preds, dim=0)
+    # print_distribution(preds.argmax(dim=1))
     labels = torch.cat(all_labels, dim=0)
     return total_loss / len(loader.dataset), compute_accuracy(labels, preds)
 
 
-def inference(model: nn.Module, input: HeteroData, device: torch.device):
+def print_distribution(ratings_tensor: torch.Tensor):
+    # Get unique values and their counts
+    ratings_tensor = ratings_tensor.cpu()
+    unique_values, counts = torch.unique(ratings_tensor, return_counts=True)
+
+    # Calculate percentages
+    total_ratings = len(ratings_tensor)
+    percentages = (counts / total_ratings * 100).numpy()
+
+    # Sort the results
+    sorted_indices = torch.argsort(unique_values)
+    unique_values = unique_values[sorted_indices].numpy()
+    percentages = percentages[sorted_indices]
+
+    # Print percentage distribution
+    print("Percentage distribution of ratings:")
+    for rating, percentage in zip(unique_values, percentages):
+        print(f"Rating {rating}: {percentage:.2f}%")
+
+
+def inference(model: nn.Module, input: DataLoader, device: torch.device):
     model.eval()
+    all_preds = []
     with torch.no_grad():
-        input = input.to(device)
-        pred = model(input)
-        probabilities = F.softmax(pred, dim=1)
-        predicted_ratings = probabilities.argmax(dim=1) / 2
-    return probabilities, predicted_ratings
+        for batch in input:
+            batch = batch.to(device)
+            pred = model(batch)
+            probabilities = F.softmax(pred, dim=1)
+            movie_id = batch["user", "rates", "movie"]["edge_index"][1]
+            all_preds.append(probabilities.argmax(dim=1))
+    return all_preds
 
 
 def compute_accuracy(labels: torch.Tensor, preds: torch.Tensor) -> float:
     """Compute accuracy for multi-class classification."""
-    return accuracy_score(labels.numpy(), preds.argmax(dim=1).numpy())
+    return accuracy_score(labels.cpu().numpy(), preds.argmax(dim=1).cpu().numpy())
 
 
 def save_model(model: nn.Module, accuracy: float, save_path: str):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     model_type = model.model_type
     filename = f"model_{model_type}_{timestamp}_acc{accuracy:.4f}.pt"
-    torch.save(model.state_dict(), f"{save_path}/{filename}")
+
+    save_dict = {
+        "model_state_dict": model.state_dict(),
+        "config": model.config,  # Assume we add this attribute to the model
+        "data_info": model.data_info,
+        "model_type": model_type,
+        "accuracy": accuracy,
+    }
+
+    torch.save(save_dict, f"{save_path}/{filename}")
     print(f"Model saved: {filename}")
 
 
@@ -293,15 +332,20 @@ def print_rating_distribution(data):
     print("Rating distribution:")
     for rating, count in zip(unique.tolist(), counts.tolist()):
         percentage = count / total * 100
-        print(f"Rating {rating/2:.1f}: {count} ({percentage:.2f}%)")
+        print(f"Rating {rating:.1f}: {count} ({percentage:.2f}%)")
 
 
-def load_model(model_path: str, config: dict, data, device: torch.device):
-    model = RecommendationModel(config, data, "gat").to(device)
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
+def load_model(model_path: str, device: torch.device):
+    saved_dict = torch.load(model_path, map_location=device)
+
+    config = saved_dict["config"]
+    data_info = saved_dict["data_info"]
+
+    model = RecommendationModel(config, data_info, saved_dict["model_type"]).to(device)
+    model.load_state_dict(saved_dict["model_state_dict"])
     model.eval()
-    return model
+
+    return model, config, data_info
 
 
 def main():
@@ -321,7 +365,7 @@ def main():
         "hidden_dim": 256,
         "num_layers": 3,
         "num_heads": 3,
-        "edge_dim": 7,
+        "edge_dim": 6,
         "learning_rate": 0.0001,
         "epochs": 5,
         "neighbors": [10, 5, 5],
@@ -334,8 +378,18 @@ def main():
         small=False,
     )
     print_rating_distribution(data)
-    model = RecommendationModel(config_gat, data, "gat").to(device)
 
+    data_info = {
+        "num_user_nodes": data["user"].num_nodes,
+        "num_movie_nodes": data["movie"].num_nodes,
+        "num_director_nodes": data["director"].num_nodes,
+        "num_genre_nodes": data["genre"].num_nodes,
+        "movie_feature_dim": data["movie"].x.shape[1],
+        "metadata": data.metadata(),
+    }
+
+    # model = RecommendationModel(config_gat, data_info, "gat").to(device)
+    model, _, _ = load_model("./model/model_gat_20240923_1901_acc0.8952.pt", device)
     trained_model, losses, accuracies = train_gnn(
         model,
         train_loader,
@@ -344,6 +398,7 @@ def main():
         num_epochs=config_gat["epochs"],
         lr=config_gat["learning_rate"],
     )
+
     return trained_model, losses, accuracies
 
 

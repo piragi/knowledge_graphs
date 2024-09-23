@@ -15,7 +15,7 @@ class MovieDataProcessor:
         # torch.manual_seed(500)
         self.path = "./data/small" if small else "./data"
 
-    def read_tmdb_movies(self):
+    def read_tmdb_movies(self, ratings_path="ratings.csv"):
         columns_of_interest = [
             "budget",
             "revenue",
@@ -38,7 +38,7 @@ class MovieDataProcessor:
         movies_df = pd.merge(
             movies_linked_df, movies_info_df, on="movieId", how="inner"
         )
-        ratings_df = pd.read_csv(f"{self.path}/ratings.csv")
+        ratings_df = pd.read_csv(f"{self.path}/{ratings_path}")
         ratings_df = ratings_df[ratings_df["movieId"].isin(movies_df["movieId"])]
 
         # Process credits data to get directors
@@ -274,6 +274,7 @@ class MovieDataProcessor:
             min(5, max(0, int(rating))) if pd.notna(rating) else 0
         )
         ratings_df["grouped_rating"] = ratings_df["rating"].apply(group_ratings)
+        print(ratings_df["grouped_rating"].unique())
 
         return (
             edge_index_user_to_movie,
@@ -314,7 +315,7 @@ class MovieDataProcessor:
         data["genre", "is_genre", "movie"].edge_index = edge_index_genre_to_movie
 
         grouped_ratings = torch.from_numpy(ratings_df["grouped_rating"].values).long()
-        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=7).float()
+        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=6).float()
         data["user", "rates", "movie"].edge_attr = one_hot_ratings
         data["user", "rates", "movie"].edge_label = grouped_ratings
 
