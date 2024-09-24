@@ -1,3 +1,4 @@
+import ast
 import sys
 from collections import defaultdict
 
@@ -14,7 +15,7 @@ class MovieDataProcessor:
         # torch.manual_seed(500)
         self.path = "./data/small" if small else "./data"
 
-    def read_tmdb_movies(self):
+    def read_tmdb_movies(self, ratings_path="ratings.csv"):
         columns_of_interest = [
             "budget",
             "revenue",
@@ -37,8 +38,34 @@ class MovieDataProcessor:
         movies_df = pd.merge(
             movies_linked_df, movies_info_df, on="movieId", how="inner"
         )
-        ratings_df = pd.read_csv(f"{self.path}/ratings.csv")
+        ratings_df = pd.read_csv(f"{self.path}/{ratings_path}")
         ratings_df = ratings_df[ratings_df["movieId"].isin(movies_df["movieId"])]
+
+        # Process credits data to get directors
+        credits_df = pd.read_csv("./data/tmdb_5000_credits.csv")
+        credits_df["crew"] = credits_df["crew"].apply(ast.literal_eval)
+
+        get_director = lambda crew: next(
+            (member["id"] for member in crew if member["job"] == "Director"), None
+        )
+
+        credits_df["directorId"] = credits_df["crew"].map(get_director)
+
+        # Merge director information with movies_df
+        movies_df = pd.merge(
+            movies_df,
+            credits_df[["movie_id", "directorId"]],
+            left_on="id",
+            right_on="movie_id",
+            how="left",
+        )
+        movies_df = movies_df[movies_df["movieId"].isin(ratings_df["movieId"])]
+
+        # Merge director information with ratings_df
+        ratings_df = pd.merge(
+            ratings_df, movies_df["movieId"], on="movieId", how="left"
+        )
+
         return movies_df, ratings_df
 
     @staticmethod
@@ -148,12 +175,72 @@ class MovieDataProcessor:
         num_features = movies_df[numerical_features].values.astype(float)
         num_features_standardized = self.standardize(num_features)
         num_tensors = torch.from_numpy(num_features_standardized).float()
-        return torch.cat([torch.from_numpy(genres.values).float(), num_tensors], dim=1)
+        return num_tensors
+        # return torch.cat([torch.from_numpy(genres.values).float(), num_tensors], dim=1)
 
-    def process_data(self, ratings_df):
+    def process_data(self, ratings_df, movies_df):
         ratings_df = ratings_df.dropna(subset=["rating"])
         # self.analyze_user_data(ratings_df, movies_df)
 
+        # Process genres
+        genres = movies_df["genres"].str.get_dummies("|")
+        genres["movieId"] = movies_df["movieId"]  # Add movieId to the genres DataFrame
+
+        # Melt the genres DataFrame to create a long format
+        genres_long = genres.melt(
+            id_vars=["movieId"], var_name="genreName", value_name="hasGenre"
+        )
+
+        # Keep only the rows where the movie has the genre
+        genres_long = genres_long[genres_long["hasGenre"] == 1].drop("hasGenre", axis=1)
+
+        # Create unique mappings
+        unique_genre_id = pd.DataFrame(
+            data={
+                "genreName": genres.columns[:-1],  # Exclude 'movieId'
+                "mappedId": pd.RangeIndex(len(genres.columns) - 1),
+            }
+        )
+
+        unique_director_id = movies_df["directorId"].unique()
+        unique_director_id = pd.DataFrame(
+            data={
+                "directorId": unique_director_id,
+                "mappedId": pd.RangeIndex(len(unique_director_id)),
+            }
+        )
+
+        unique_movie_id = movies_df["movieId"].unique()
+        unique_movie_id = pd.DataFrame(
+            data={
+                "movieId": unique_movie_id,
+                "mappedId": pd.RangeIndex(len(unique_movie_id)),
+            }
+        )
+        # Create edge indices for genre to movie
+        genre_movie_mapped = pd.merge(
+            genres_long, unique_genre_id, on="genreName", how="left"
+        )
+        genre_movie_mapped = pd.merge(
+            genre_movie_mapped, unique_movie_id, on="movieId", how="left"
+        )
+
+        genre_ids = torch.from_numpy(genre_movie_mapped["mappedId_x"].values)
+        movie_ids = torch.from_numpy(genre_movie_mapped["mappedId_y"].values)
+        edge_index_genre_to_movie = torch.stack([genre_ids, movie_ids], dim=0)
+
+        directed_director_id = pd.merge(
+            movies_df["directorId"], unique_director_id, on="directorId", how="left"
+        )
+        directed_director_id = torch.from_numpy(directed_director_id["mappedId"].values)
+        directed_movie_id = pd.merge(
+            movies_df["movieId"], unique_movie_id, on="movieId", how="left"
+        )
+        directed_movie_id = torch.from_numpy(directed_movie_id["mappedId"].values)
+
+        edge_index_director_to_movie = torch.stack(
+            [directed_director_id, directed_movie_id], dim=0
+        )
         # Construct a compact representation of the data
         unique_user_id = ratings_df["userId"].unique()
         unique_user_id = pd.DataFrame(
@@ -187,31 +274,48 @@ class MovieDataProcessor:
             min(5, max(0, int(rating))) if pd.notna(rating) else 0
         )
         ratings_df["grouped_rating"] = ratings_df["rating"].apply(group_ratings)
+        print(ratings_df["grouped_rating"].unique())
 
-        ratings_df["grouped_rating"] = ratings_df["rating"].apply(group_ratings)
-        return edge_index_user_to_movie, ratings_df, unique_user_id, unique_movie_id
+        return (
+            edge_index_user_to_movie,
+            edge_index_director_to_movie,
+            edge_index_genre_to_movie,
+            ratings_df,
+            unique_user_id,
+            unique_movie_id,
+            unique_director_id,
+            unique_genre_id,
+        )
 
     def create_hetero_data(
         self,
         ratings_df,
         movies_df,
         edge_index_user_to_movie,
+        edge_index_director_to_movie,
+        edge_index_genre_to_movie,
         unique_user_id,
         unique_movie_id,
+        unique_director_id,
+        unique_genre_id,
         user_features=None,
     ):
         data = HeteroData()
 
         data["user"].node_id = torch.arange(len(unique_user_id))
         data["movie"].node_id = torch.arange(len(unique_movie_id))
+        data["director"].node_id = torch.arange(len(unique_director_id))
+        data["genre"].node_id = torch.arange(len(unique_genre_id))
 
         data["movie"].x = self.generate_movie_features(movies_df, ratings_df)
         # data['user'].x = torch.tensor(user_features.values, dtype=torch.float)
 
         data["user", "rates", "movie"].edge_index = edge_index_user_to_movie
+        data["director", "directs", "movie"].edge_index = edge_index_director_to_movie
+        data["genre", "is_genre", "movie"].edge_index = edge_index_genre_to_movie
 
         grouped_ratings = torch.from_numpy(ratings_df["grouped_rating"].values).long()
-        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=7).float()
+        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=6).float()
         data["user", "rates", "movie"].edge_attr = one_hot_ratings
         data["user", "rates", "movie"].edge_label = grouped_ratings
 
@@ -220,13 +324,21 @@ class MovieDataProcessor:
 
     def generate_loaders(self, train_data, batch_size=2048, num_neighbors=[5, 5]):
         transform = T.RandomLinkSplit(
-            num_val=0.2,
+            num_val=0.1,
             num_test=0.1,
             disjoint_train_ratio=0.3,
             neg_sampling_ratio=2.0,
             add_negative_train_samples=False,
-            edge_types=("user", "rates", "movie"),
-            rev_edge_types=("movie", "rev_rates", "user"),
+            edge_types=[
+                ("user", "rates", "movie"),
+                ("director", "directs", "movie"),
+                ("genre", "is_genre", "movie"),
+            ],
+            rev_edge_types=[
+                ("movie", "rev_rates", "user"),
+                ("movie", "rev_directs", "director"),
+                ("movie", "rev_is_genre", "genre"),
+            ],
             key="edge_label",
         )
         train_data, val_data, test_data = transform(train_data)
@@ -252,6 +364,10 @@ class MovieDataProcessor:
 
     def process_data_kge(self):
         movies_df, ratings_df = self.read_tmdb_movies()
+        movies_df = movies_df.dropna(subset=["directorId"])
+        ratings_df = ratings_df[ratings_df["movieId"].isin(movies_df["movieId"])]
+        genres = movies_df["genres"].str.get_dummies("|")
+        all_genres = genres.columns.tolist()
 
         # Create entity mappings
         user_mapping = {
@@ -260,6 +376,15 @@ class MovieDataProcessor:
         movie_mapping = {
             movie_id: idx + len(user_mapping)
             for idx, movie_id in enumerate(movies_df["movieId"].unique())
+        }
+        director_mapping = {
+            director_id: idx + len(user_mapping) + len(movie_mapping)
+            for idx, director_id in enumerate(movies_df["directorId"].unique())
+        }
+
+        genre_mapping = {
+            genre: idx + len(user_mapping) + len(movie_mapping) + len(director_mapping)
+            for idx, genre in enumerate(all_genres)
         }
 
         # Create edge index
@@ -281,13 +406,48 @@ class MovieDataProcessor:
             edge_type.max() == 9 and edge_type.min() == 0
         ), "Edge types should be between 0 and 9"
 
+        movie_indices = torch.tensor(
+            [movie_mapping[movie] for movie in movies_df["movieId"]], dtype=torch.long
+        )
+        director_indices = torch.tensor(
+            [director_mapping[director] for director in movies_df["directorId"]],
+            dtype=torch.long,
+        )
+        directed_edge_index = torch.stack([director_indices, movie_indices], dim=0)
+        directed_edge_type = torch.full((directed_edge_index.size(1),), 10)
+
+        # Create movie-genre edges
+        movie_genre_edges = []
+        for movie_id, movie_genres in zip(movies_df["movieId"], genres.values):
+            for genre, has_genre in zip(all_genres, movie_genres):
+                if has_genre:
+                    movie_genre_edges.append(
+                        (movie_mapping[movie_id], genre_mapping[genre])
+                    )
+        movie_genre_edge_index = torch.tensor(movie_genre_edges, dtype=torch.long).t()
+        movie_genre_edge_type = torch.full(
+            (movie_genre_edge_index.size(1),), 11, dtype=torch.long
+        )
+
+        # Combine all edges and edge types
+        combined_edge_index = torch.cat(
+            [edge_index, directed_edge_index, movie_genre_edge_index], dim=1
+        )
+        combined_edge_type = torch.cat(
+            [edge_type, directed_edge_type, movie_genre_edge_type]
+        )
+
         # Create Data object
         data = Data(
-            edge_index=edge_index,
-            edge_type=edge_type,
-            num_nodes=len(user_mapping) + len(movie_mapping),
-            num_edge_types=10,  # We now have 10 possible ratings
+            edge_index=combined_edge_index,
+            edge_type=combined_edge_type,
+            num_nodes=len(user_mapping)
+            + len(movie_mapping)
+            + len(director_mapping)
+            + len(genre_mapping),
+            num_edge_types=12,  # 0-9 for ratings, 10 for director-movie, 11 for movie-genre
         )
+
         return data
 
     def prepare_data_kge(self):
@@ -326,15 +486,26 @@ class MovieDataProcessor:
 def get_sageconv_movie_data_and_loaders(neighbors=[5, 5], batch_size=2048, small=False):
     processor = MovieDataProcessor(small)
     movies_df, ratings_df = processor.read_tmdb_movies()
-    edge_index_user_to_movie, train_ratings_df, unique_user_id, unique_movie_id = (
-        processor.process_data(ratings_df)
-    )
+    (
+        edge_index_user_to_movie,
+        edge_index_director_to_movie,
+        edge_index_genre_to_movie,
+        train_ratings_df,
+        unique_user_id,
+        unique_movie_id,
+        unique_director_id,
+        unique_genre_id,
+    ) = processor.process_data(ratings_df, movies_df)
     train_data = processor.create_hetero_data(
         train_ratings_df,
         movies_df,
         edge_index_user_to_movie,
+        edge_index_director_to_movie,
+        edge_index_genre_to_movie,
         unique_user_id,
         unique_movie_id,
+        unique_director_id,
+        unique_genre_id,
     )
     train_loader, val_loader, test_loader = processor.generate_loaders(
         train_data, batch_size=batch_size, num_neighbors=neighbors
