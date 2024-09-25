@@ -1,19 +1,41 @@
+from datetime import datetime
+
 import torch
 import torch.optim as optim
-from torch_geometric.nn import TransE
-from data import get_movie_data_kge
+from torch_geometric.nn import RotatE, TransE
 from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import roc_auc_score
-from collections import defaultdict
+
+from data import get_movie_data_kge
+
 
 class MovieRecommendationModel:
-    def __init__(self, num_nodes, num_relations, hidden_channels=50):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = TransE(num_nodes, num_relations, hidden_channels).to(self.device)
+    def __init__(
+        self, num_nodes, num_relations, hidden_channels=100, model_type="transe"
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_type = model_type
+        self.config = {
+            "num_nodes": num_nodes,
+            "num_relations": num_relations,
+            "hidden_channels": hidden_channels,
+            "model_type": model_type,
+        }
+        self.data_info = None  # This will be set when loading data
+
+        if model_type == "transe":
+            self.model = TransE(num_nodes, num_relations, hidden_channels).to(
+                self.device
+            )
+        elif model_type == "rotate":
+            self.model = RotatE(num_nodes, num_relations, hidden_channels).to(
+                self.device
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.01)
 
-    def create_loader(self, data, batch_size=1024000):
+    def create_loader(self, data, batch_size=20000):
         return self.model.loader(
             head_index=data.edge_index[0].to(self.device),
             rel_type=data.edge_type.to(self.device),
@@ -25,7 +47,7 @@ class MovieRecommendationModel:
     def train_epoch(self, loader):
         self.model.train()
         total_loss = 0
-        for batch in tqdm(loader, desc="Training"):
+        for batch in loader:
             self.optimizer.zero_grad()
             loss = self.model.loss(*[b.to(self.device) for b in batch])
             loss.backward()
@@ -36,104 +58,85 @@ class MovieRecommendationModel:
     @torch.no_grad()
     def evaluate(self, loader):
         self.model.eval()
-        total_loss = sum(float(self.model.loss(*[b.to(self.device) for b in batch])) * batch[0].size(0) for batch in tqdm(loader, desc="Evaluating"))
+        total_loss = sum(
+            float(self.model.loss(*[b.to(self.device) for b in batch]))
+            * batch[0].size(0)
+            for batch in tqdm(loader, desc="Evaluating")
+        )
         return total_loss / len(loader.dataset)
 
-    def generate_negative_samples_batch(self, edge_index, edge_type, num_nodes, num_neg_samples, batch_size=1000000):
-        pos_edges = set(map(tuple, edge_index.t().cpu().numpy()))
-        existing_edges = defaultdict(set)
-        for (head, tail) in pos_edges:
-            existing_edges[head].add(tail)
-    
-        neg_edges = []
-        neg_types = []
-    
-        while len(neg_edges) < num_neg_samples:
-            # Generate a batch of candidate edges
-            heads = np.random.randint(0, num_nodes, batch_size)
-            tails = np.random.randint(0, num_nodes, batch_size)
-            types = np.random.choice(edge_type.cpu().numpy(), batch_size)
-        
-            # Filter the batch
-            for i in range(batch_size):
-                if len(neg_edges) >= num_neg_samples:
-                    break
-                if tails[i] not in existing_edges[heads[i]] and heads[i] != tails[i]:
-                    neg_edges.append((heads[i], tails[i]))
-                    neg_types.append(types[i])
-    
-        neg_edge_index = torch.tensor(neg_edges, device=self.device).t()
-        neg_edge_type = torch.tensor(neg_types, device=self.device)
-    
-        return neg_edge_index, neg_edge_type
-
     @torch.no_grad()
-    def compute_auc(self, edge_index, edge_type, batch_size=512000):
+    def test(self, data, batch_size=20000, k=10):
         self.model.eval()
-        pos_edge_index, pos_edge_type = edge_index.to(self.device), edge_type.to(self.device)
-
-        def process_edges(edges, types):
-            preds = []
-            for i in range(0, edges.size(1), batch_size):
-                batch_edges = edges[:, i:i+batch_size]
-                batch_types = types[i:i+batch_size]
-                pred = self.model(batch_edges[0], batch_types, batch_edges[1])
-                preds.append(pred)
-            return torch.cat(preds, dim=0)
-
-        pos_pred = process_edges(pos_edge_index, pos_edge_type)
-    
-        # Generate negative samples
-        neg_edge_index, neg_edge_type = self.generate_negative_samples_batch(
-            pos_edge_index, pos_edge_type, self.model.num_nodes, pos_edge_index.size(1)
+        return self.model.test(
+            head_index=data.edge_index[0].to(self.device),
+            rel_type=data.edge_type.to(self.device),
+            tail_index=data.edge_index[1].to(self.device),
+            batch_size=batch_size,
+            k=k,
         )
-        neg_pred = process_edges(neg_edge_index, neg_edge_type)
 
-        pred = torch.cat([pos_pred, neg_pred]).cpu().numpy()
-        true = np.concatenate([np.ones(pos_pred.size(0)), np.zeros(neg_pred.size(0))])
+    def save_model(self, accuracy: float, save_path: str):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename = f"model_{self.model_type}_{timestamp}_acc{accuracy:.4f}.pt"
+        save_dict = {
+            "model_state_dict": self.model.state_dict(),
+            "config": self.config,
+            "data_info": self.data_info,
+            "model_type": self.model_type,
+            "accuracy": accuracy,
+        }
+        torch.save(save_dict, f"{save_path}/{filename}")
+        print(f"Model saved: {filename}")
 
-        return roc_auc_score(true, pred)
+    @classmethod
+    def load_model(cls, load_path: str):
+        save_dict = torch.load(load_path)
+        config = save_dict["config"]
+        model = cls(
+            num_nodes=config["num_nodes"],
+            num_relations=config["num_relations"],
+            hidden_channels=config["hidden_channels"],
+            model_type=config["model_type"],
+        )
+        model.model.load_state_dict(save_dict["model_state_dict"])
+        model.data_info = save_dict["data_info"]
+        print(f"Model loaded: {load_path}")
+        print(f"Loaded model accuracy: {save_dict['accuracy']:.4f}")
+        return model
+
 
 def main():
-    train_data, val_data, test_data = get_movie_data_kge()
+    train_data, val_data, test_data = get_movie_data_kge(small=False)
     model = MovieRecommendationModel(train_data.num_nodes, train_data.num_edge_types)
-    
+    model.data_info = {
+        "num_nodes": train_data.num_nodes,
+        "num_edge_types": train_data.num_edge_types,
+    }
     train_loader = model.create_loader(train_data)
-    val_loader = model.create_loader(val_data)
+    num_epochs = 500
 
-    num_epochs = 2
+    best_accuracy = 0
     for epoch in range(1, num_epochs + 1):
-        loss = model.train_epoch(train_loader)
-        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}')
-        if epoch % 5 == 0:
-            val_loss = model.evaluate(val_loader)
-            val_auc = model.compute_auc(val_data.edge_index, val_data.edge_type)
-            print(f'Epoch: {epoch:03d}, Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}')
-        print(f'GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}GB')
+        model.train_epoch(train_loader)
+        if epoch % 25 == 0:
+            rank, mrr, hits = model.test(val_data)
+            accuracy = hits  # Using Hits@10 as accuracy
+            print(
+                f"Epoch: {epoch:03d}, Val Mean Rank: {rank:.2f}, "
+                f"Val MRR: {mrr:.4f}, Val Hits@10: {hits:.4f}"
+            )
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                model.save_model(accuracy, "./model")
 
-    test_auc = model.compute_auc(test_data.edge_index, test_data.edge_type)
-    print(f'Test AUC: {test_auc:.4f}')
+    # Final test
+    rank, mrr, hits_at_10 = model.test(test_data)
+    print(
+        f"Test Mean Rank: {rank:.2f}, Test MRR: {mrr:.4f}, "
+        f"Test Hits@10: {hits_at_10:.4f}"
+    )
+
 
 if __name__ == "__main__":
     main()
-
-def train_kge_model():
-    train_data, val_data, test_data = get_movie_data_kge(small=True)
-    model = MovieRecommendationModel(train_data.num_nodes, train_data.num_edge_types)
-    
-    train_loader = model.create_loader(train_data)
-    val_loader = model.create_loader(val_data)
-
-    num_epochs = 2
-    for epoch in range(1, num_epochs + 1):
-        loss = model.train_epoch(train_loader)
-        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}')
-        if epoch % 5 == 0:
-            val_loss = model.evaluate(val_loader)
-            val_auc = model.compute_auc(val_data.edge_index, val_data.edge_type)
-            print(f'Epoch: {epoch:03d}, Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}')
-        print(f'GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f}GB')
-
-    test_auc = model.compute_auc(test_data.edge_index, test_data.edge_type)
-    print(f'Test AUC: {test_auc:.4f}')
-    return model
