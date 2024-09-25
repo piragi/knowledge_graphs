@@ -134,17 +134,19 @@ class RecommendationModel(nn.Module):
         self.model_type = model_type
         self.data_info = data_info
 
-        self.movie_lin = nn.Linear(data_info["movie_feature_dim"], config["hidden_dim"])
         self.genre_emb = nn.Embedding(
             data_info["num_genre_nodes"], config["hidden_dim"]
         )
         self.user_emb = nn.Embedding(data_info["num_user_nodes"], config["hidden_dim"])
+        self.user_lin = nn.Linear(data_info["user_feature_dim"], config["hidden_dim"])
+
         self.director_emb = nn.Embedding(
             data_info["num_director_nodes"], config["hidden_dim"]
         )
         self.movie_emb = nn.Embedding(
             data_info["num_movie_nodes"], config["hidden_dim"]
         )
+        self.movie_lin = nn.Linear(data_info["movie_feature_dim"], config["hidden_dim"])
 
         if self.model_type == "gnn":
             self.conv = GNN(
@@ -168,7 +170,7 @@ class RecommendationModel(nn.Module):
 
     def forward(self, data: HeteroData) -> Tensor:
         x_dict = {
-            "user": self.user_emb(data["user"].node_id),
+            "user": self.user_lin(data["user"].x) + self.user_emb(data["user"].node_id),
             "director": self.director_emb(data["director"].node_id),
             "genre": self.genre_emb(data["genre"].node_id),
             "movie": self.movie_lin(data["movie"].x)
@@ -351,6 +353,7 @@ def load_model(model_path: str, device: torch.device):
 def main():
     config = {
         "movie_feature_dim": 24,
+        "user_feature_dim": 1,
         "hidden_dim": 1024,
         "num_layers": 1,
         "edge_dim": 7,
@@ -362,6 +365,7 @@ def main():
     config_gat = {
         "batch_size": 2048,
         "movie_feature_dim": 4,
+        "user_feature_dim": 1,
         "hidden_dim": 256,
         "num_layers": 3,
         "num_heads": 3,
@@ -385,11 +389,12 @@ def main():
         "num_director_nodes": data["director"].num_nodes,
         "num_genre_nodes": data["genre"].num_nodes,
         "movie_feature_dim": data["movie"].x.shape[1],
+        "user_feature_dim": data["user"].x.shape[1],
         "metadata": data.metadata(),
     }
 
-    # model = RecommendationModel(config_gat, data_info, "gat").to(device)
-    model, _, _ = load_model("./model/model_gat_20240923_1901_acc0.8952.pt", device)
+    model = RecommendationModel(config_gat, data_info, "gat").to(device)
+    # model, _, _ = load_model("./model/model_gat_20240923_1901_acc0.8952.pt", device)
     trained_model, losses, accuracies = train_gnn(
         model,
         train_loader,
