@@ -8,8 +8,11 @@ from data import get_gnn_inference_data
 from model import inference, load_model
 
 
-def run_gnn_inference(inference_path="inference_data.csv", small=False):
-    model_path = "./model/model_sage_20240927_2159_acc0.7689.pt"
+def run_gnn_inference(
+    inference_path="inference_data.csv", small=False, model_path=None
+):
+    if small and model_path is None:
+        model_path = "./model/model_sage_20240928_1732_acc0.7090.pt"
     loader = get_gnn_inference_data(inference_path, small)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, _ = load_model(model_path, device)

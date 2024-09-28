@@ -372,7 +372,7 @@ def run_training(model_type="gat", small=False):
         "num_heads": 2,
         "edge_dim": 6,
         "learning_rate": 0.001,
-        "epochs": 5,
+        "epochs": 10,
         "neighbors": [10, 5, 5],
     }
     if model_type == "gat":

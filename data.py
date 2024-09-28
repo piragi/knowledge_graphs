@@ -22,6 +22,7 @@ class MovieDataProcessor:
         self.path = "./data/small" if small else "./data"
         self.processed_ratings_path = os.path.join(self.path, "ratings_processed.csv")
         self.processed_movies_path = os.path.join(self.path, "movies_processed.csv")
+        self.model_zip = "./model.zip"
         self.tmdb_zip_file = "tmdb_5000_extr.zip"
         self.tmdb_movies_file = "tmdb_5000_movies.csv"
         self.tmdb_credits_file = "tmdb_5000_credits.csv"
@@ -37,8 +38,16 @@ class MovieDataProcessor:
     def ensure_data_availability(self):
         if not os.path.exists(self.path):
             os.makedirs(self.path)
-        if not os.path.exists("./model/"):
-            os.makedirs(os.path.join("./model"))
+        if not os.path.exists("./model"):
+            if os.path.exists(self.model_zip):
+                print(f"Extracting {self.model_zip}...")
+                with zipfile.ZipFile(self.model_zip, "r") as zip_ref:
+                    zip_ref.extractall("./model/")
+                print("Checkpoints extracted successfully")
+            else:
+                print(
+                    f"Warning: {self.model_zip} not found. Checkpoint data might be missing."
+                )
 
         # Check and download MovieLens data
         if not (

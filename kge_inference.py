@@ -163,12 +163,12 @@ def save_recommendations_to_csv(recommendations: List[Dict], output_file: str):
             writer.writerow(recommendation)
 
 
-def run_kge_inference(small=False):
-    kge_model = MovieRecommendationModel.load_model(
-        "./model/model_transe_20240927_1415_acc0.8233.pt"
-    )
+def run_kge_inference(model_path=None):
+    if model_path is None:
+        model_path = "./model/model_transe_20240927_1415_acc0.8233.pt"
+    kge_model = MovieRecommendationModel.load_model(model_path)
 
-    processor = MovieDataProcessor(small)
+    processor = MovieDataProcessor()
     data = processor.process_data_kge()
     mappings = processor.get_mappings()
 
