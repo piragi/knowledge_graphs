@@ -22,6 +22,9 @@ class MovieDataProcessor:
         self.path = "./data/small" if small else "./data"
         self.processed_ratings_path = os.path.join(self.path, "ratings_processed.csv")
         self.processed_movies_path = os.path.join(self.path, "movies_processed.csv")
+        self.tmdb_zip_file = "tmdb_5000_extr.zip"
+        self.tmdb_movies_file = "tmdb_5000_movies.csv"
+        self.tmdb_credits_file = "tmdb_5000_credits.csv"
         self.movie_mapping = {}
         self.director_mapping = {}
         self.genre_mapping = {}
@@ -34,12 +37,35 @@ class MovieDataProcessor:
     def ensure_data_availability(self):
         if not os.path.exists(self.path):
             os.makedirs(self.path)
+        if not os.path.exists("./model/"):
+            os.makedirs(os.path.join("./model"))
 
+        # Check and download MovieLens data
         if not (
             os.path.exists(self.processed_ratings_path)
             and os.path.exists(self.processed_movies_path)
+            and os.path.exists(os.path.join(self.path, "ratings.csv"))
+            and os.path.exists(os.path.join(self.path, "links.csv"))
+            and os.path.exists(os.path.join(self.path, "movies.csv"))
         ):
             self.download_and_extract_data()
+
+        # Check and extract TMDB data
+        movie_data_path = "./data/"
+        tmdb_zip_path = os.path.join(movie_data_path, self.tmdb_zip_file)
+        tmdb_movies_path = os.path.join(movie_data_path, self.tmdb_movies_file)
+        tmdb_credits_path = os.path.join(movie_data_path, self.tmdb_credits_file)
+
+        if not (os.path.exists(tmdb_movies_path) and os.path.exists(tmdb_credits_path)):
+            if os.path.exists(tmdb_zip_path):
+                print(f"Extracting {self.tmdb_zip_file}...")
+                with zipfile.ZipFile(tmdb_zip_path, "r") as zip_ref:
+                    zip_ref.extractall(movie_data_path)
+                print("TMDB data extracted successfully.")
+            else:
+                print(
+                    f"Warning: {self.tmdb_zip_file} not found. TMDB data might be missing."
+                )
 
     def download_and_extract_data(self):
         zip_path = os.path.join(self.path, self.zip_file)
@@ -65,7 +91,7 @@ class MovieDataProcessor:
         os.remove(zip_path)
         os.rmdir(extracted_folder)
 
-        print("Data downloaded and extracted successfully.")
+        print("MovieLens data downloaded and extracted successfully.")
 
     def read_tmdb_movies(self, gnn_inference_path=None):
         self.ensure_data_availability()

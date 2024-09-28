@@ -1,5 +1,5 @@
-torch
-torch-geometric
+torch==2.4.0
+torch_geometric
 scikit-learn
 tqdm
 pandas
