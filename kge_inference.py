@@ -165,7 +165,7 @@ def save_recommendations_to_csv(recommendations: List[Dict], output_file: str):
 
 def run_kge_inference(model_path=None):
     if model_path is None:
-        model_path = "./model/model_transe_20240927_1415_acc0.8233.pt"
+        model_path = "./model/model_transe_20240927_1953_acc0.8165.pt"
     kge_model = MovieRecommendationModel.load_model(model_path)
 
     processor = MovieDataProcessor()
