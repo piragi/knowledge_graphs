@@ -1,20 +1,24 @@
 import ast
 import os
-import sys
-from collections import defaultdict
+import shutil
+import zipfile
 
 import numpy as np
 import pandas as pd
+import requests
 import torch
 import torch.nn.functional as F
 import torch_geometric.transforms as T
-from torch_geometric.data import Data, HeteroData, RandomNodeLoader
-from torch_geometric.loader import LinkNeighborLoader, NeighborLoader
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import LinkNeighborLoader
 
 
 class MovieDataProcessor:
     def __init__(self, small=False):
-        # torch.manual_seed(500)
+        self.small = small
+        self.base_url = "https://files.grouplens.org/datasets/movielens/"
+        self.zip_file = "ml-latest-small.zip" if small else "ml-latest.zip"
+        self.folder_name = "ml-latest-small" if small else "ml-latest"
         self.path = "./data/small" if small else "./data"
         self.processed_ratings_path = os.path.join(self.path, "ratings_processed.csv")
         self.processed_movies_path = os.path.join(self.path, "movies_processed.csv")
@@ -27,7 +31,45 @@ class MovieDataProcessor:
         self.movie_titles = {}
         self.director_names = {}
 
+    def ensure_data_availability(self):
+        if not os.path.exists(self.path):
+            os.makedirs(self.path)
+
+        if not (
+            os.path.exists(self.processed_ratings_path)
+            and os.path.exists(self.processed_movies_path)
+        ):
+            self.download_and_extract_data()
+
+    def download_and_extract_data(self):
+        zip_path = os.path.join(self.path, self.zip_file)
+
+        # Download the zip file
+        url = self.base_url + self.zip_file
+        print(f"Downloading {url}...")
+        response = requests.get(url)
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+
+        # Extract the zip file
+        print(f"Extracting {self.zip_file}...")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(self.path)
+
+        # Move files from the extracted folder to the data directory
+        extracted_folder = os.path.join(self.path, self.folder_name)
+        for file in os.listdir(extracted_folder):
+            shutil.move(os.path.join(extracted_folder, file), self.path)
+
+        # Remove the zip file and the empty extracted folder
+        os.remove(zip_path)
+        os.rmdir(extracted_folder)
+
+        print("Data downloaded and extracted successfully.")
+
     def read_tmdb_movies(self, gnn_inference_path=None):
+        self.ensure_data_availability()
+
         # Check if processed files exist
         if (
             os.path.exists(self.processed_ratings_path)
@@ -46,7 +88,7 @@ class MovieDataProcessor:
             ratings_path = "ratings.csv"
 
         movies_df = self.process_movies_df()
-        ratings_df = pd.read_csv(f"{self.path}/{ratings_path}")
+        ratings_df = pd.read_csv(os.path.join(self.path, ratings_path))
         ratings_df = ratings_df[ratings_df["movieId"].isin(movies_df["movieId"])]
         ratings_df = pd.merge(
             ratings_df, movies_df["movieId"], on="movieId", how="left"
@@ -249,7 +291,6 @@ class MovieDataProcessor:
         movies_df,
         edge_index,
         unique_mappings,
-        user_features=None,
     ):
         data = HeteroData()
         data["user"].node_id = torch.arange(len(unique_mappings["user"]))
@@ -257,7 +298,6 @@ class MovieDataProcessor:
         data["director"].node_id = torch.arange(len(unique_mappings["director"]))
         data["genre"].node_id = torch.arange(len(unique_mappings["genre"]))
         data["movie"].x = self.read_movie_features(movies_df, ratings_df)
-        # data["user"].x = torch.tensor(user_features.values, dtype=torch.float)
         data["user", "rates", "movie"].edge_index = edge_index["user_to_movie"]
         data["director", "directs", "movie"].edge_index = edge_index[
             "director_to_movie"
@@ -341,15 +381,9 @@ class MovieDataProcessor:
         preferred_genre_tensor, _ = self.determine_preferred_genre(
             cleaned_ratings_df, movies_df, unique_mappings
         )
-        print(preferred_genre_tensor.size())
-        print(train_data["user"]["node_id"].size())
-        print(train_data["movie"]["node_id"].size())
-        print(train_data["movie"]["x"].size())
-        print(val_data["user"]["node_id"].size())
         train_data["user"].x = preferred_genre_tensor
         val_data["user"].x = preferred_genre_tensor
         test_data["user"].x = preferred_genre_tensor
-        print(train_data)
 
         create_loader = lambda data, batch_size=batch_size, shuffle=False, neg_sampling_ratio=0.0: LinkNeighborLoader(
             data,
@@ -649,8 +683,6 @@ def get_gnn_inference_data(
         unique_mappings["movie"],
     )
 
-    # generate user features and then add them to the inference data!
-
     loader = LinkNeighborLoader(
         data,
         num_neighbors=num_neighbors,
@@ -659,7 +691,6 @@ def get_gnn_inference_data(
             ("user", "rates", "movie"),
             edge_index,
         ),
-        edge_label=torch.full(edge_index[1].shape, 5),
+        edge_label=data["user", "rates", "movie"].edge_label,
     )
-    print("done processing")
     return loader

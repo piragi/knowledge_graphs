@@ -2,7 +2,7 @@ from datetime import datetime
 
 import torch
 import torch.optim as optim
-from torch_geometric.nn import RotatE, TransE
+from torch_geometric.nn import ComplEx, RotatE, TransE
 from tqdm import tqdm
 
 from data import get_movie_data_kge
@@ -26,14 +26,21 @@ class MovieRecommendationModel:
             self.model = TransE(num_nodes, num_relations, hidden_channels).to(
                 self.device
             )
+            self.optimizer = optim.Adam(self.model.parameters(), lr=0.01)
         elif model_type == "rotate":
-            self.model = RotatE(num_nodes, num_relations, hidden_channels).to(
+            self.model = RotatE(
+                num_nodes, num_relations, hidden_channels, margin=2.5
+            ).to(self.device)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        elif model_type == "complex":
+            self.model = ComplEx(num_nodes, num_relations, hidden_channels).to(
                 self.device
+            )
+            self.optimizer = optim.Adagrad(
+                self.model.parameters(), lr=0.001, weight_decay=1e-6
             )
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
-
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.01)
 
     def create_loader(self, data, batch_size=20000):
         return self.model.loader(
@@ -106,15 +113,17 @@ class MovieRecommendationModel:
         return model
 
 
-def main():
-    train_data, val_data, test_data = get_movie_data_kge(small=False)
-    model = MovieRecommendationModel(train_data.num_nodes, train_data.num_edge_types)
+def run_kge_train(model_type="transe", small=False):
+    train_data, val_data, test_data = get_movie_data_kge(small=small)
+    model = MovieRecommendationModel(
+        train_data.num_nodes, train_data.num_edge_types, model_type=model_type
+    )
     model.data_info = {
         "num_nodes": train_data.num_nodes,
         "num_edge_types": train_data.num_edge_types,
     }
     train_loader = model.create_loader(train_data)
-    num_epochs = 500
+    num_epochs = 700
 
     best_accuracy = 0
     for epoch in range(1, num_epochs + 1):
@@ -132,11 +141,8 @@ def main():
 
     # Final test
     rank, mrr, hits_at_10 = model.test(test_data)
+    model.save_model(hits_at_10, "./model")
     print(
         f"Test Mean Rank: {rank:.2f}, Test MRR: {mrr:.4f}, "
         f"Test Hits@10: {hits_at_10:.4f}"
     )
-
-
-if __name__ == "__main__":
-    main()
