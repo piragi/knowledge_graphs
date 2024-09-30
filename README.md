@@ -15,7 +15,7 @@ pip install -r requirements.txt
 ```
 pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+${CUDA}.html
 ```
-Replace `${CUDA}` with either `cpu`, `cu118`, `cu121`, or `cu124` depending on your PyTorch installation.
+Replace `${CUDA}` with either `cpu`, `cu118`, `cu121`, or `cu124` depending on your CUDA installation and version (i.e. version 12.1 needs `cu121`).
 For MacOS, only `cpu` is supported.
 
 ## Usage
