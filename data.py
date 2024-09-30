@@ -1,23 +1,31 @@
 import ast
 import os
-import sys
-from collections import defaultdict
+import shutil
+import zipfile
 
 import numpy as np
 import pandas as pd
+import requests
 import torch
 import torch.nn.functional as F
 import torch_geometric.transforms as T
-from torch_geometric.data import Data, HeteroData, RandomNodeLoader
-from torch_geometric.loader import LinkNeighborLoader, NeighborLoader
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import LinkNeighborLoader
 
 
 class MovieDataProcessor:
     def __init__(self, small=False):
-        # torch.manual_seed(500)
+        self.small = small
+        self.base_url = "https://files.grouplens.org/datasets/movielens/"
+        self.zip_file = "ml-latest-small.zip" if small else "ml-latest.zip"
+        self.folder_name = "ml-latest-small" if small else "ml-latest"
         self.path = "./data/small" if small else "./data"
         self.processed_ratings_path = os.path.join(self.path, "ratings_processed.csv")
         self.processed_movies_path = os.path.join(self.path, "movies_processed.csv")
+        self.model_zip = "./model.zip"
+        self.tmdb_zip_file = "tmdb_5000_extr.zip"
+        self.tmdb_movies_file = "tmdb_5000_movies.csv"
+        self.tmdb_credits_file = "tmdb_5000_credits.csv"
         self.movie_mapping = {}
         self.director_mapping = {}
         self.genre_mapping = {}
@@ -27,7 +35,76 @@ class MovieDataProcessor:
         self.movie_titles = {}
         self.director_names = {}
 
+    def ensure_data_availability(self):
+        if not os.path.exists(self.path):
+            os.makedirs(self.path)
+        if not os.path.exists("./model"):
+            if os.path.exists(self.model_zip):
+                print(f"Extracting {self.model_zip}...")
+                with zipfile.ZipFile(self.model_zip, "r") as zip_ref:
+                    zip_ref.extractall("./model/")
+                print("Checkpoints extracted successfully")
+            else:
+                print(
+                    f"Warning: {self.model_zip} not found. Checkpoint data might be missing."
+                )
+
+        # Check and download MovieLens data
+        if not (
+            os.path.exists(self.processed_ratings_path)
+            and os.path.exists(self.processed_movies_path)
+            and os.path.exists(os.path.join(self.path, "ratings.csv"))
+            and os.path.exists(os.path.join(self.path, "links.csv"))
+            and os.path.exists(os.path.join(self.path, "movies.csv"))
+        ):
+            self.download_and_extract_data()
+
+        # Check and extract TMDB data
+        movie_data_path = "./data/"
+        tmdb_zip_path = os.path.join(movie_data_path, self.tmdb_zip_file)
+        tmdb_movies_path = os.path.join(movie_data_path, self.tmdb_movies_file)
+        tmdb_credits_path = os.path.join(movie_data_path, self.tmdb_credits_file)
+
+        if not (os.path.exists(tmdb_movies_path) and os.path.exists(tmdb_credits_path)):
+            if os.path.exists(tmdb_zip_path):
+                print(f"Extracting {self.tmdb_zip_file}...")
+                with zipfile.ZipFile(tmdb_zip_path, "r") as zip_ref:
+                    zip_ref.extractall(movie_data_path)
+                print("TMDB data extracted successfully.")
+            else:
+                print(
+                    f"Warning: {self.tmdb_zip_file} not found. TMDB data might be missing."
+                )
+
+    def download_and_extract_data(self):
+        zip_path = os.path.join(self.path, self.zip_file)
+
+        # Download the zip file
+        url = self.base_url + self.zip_file
+        print(f"Downloading {url}...")
+        response = requests.get(url)
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+
+        # Extract the zip file
+        print(f"Extracting {self.zip_file}...")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(self.path)
+
+        # Move files from the extracted folder to the data directory
+        extracted_folder = os.path.join(self.path, self.folder_name)
+        for file in os.listdir(extracted_folder):
+            shutil.move(os.path.join(extracted_folder, file), self.path)
+
+        # Remove the zip file and the empty extracted folder
+        os.remove(zip_path)
+        os.rmdir(extracted_folder)
+
+        print("MovieLens data downloaded and extracted successfully.")
+
     def read_tmdb_movies(self, gnn_inference_path=None):
+        self.ensure_data_availability()
+
         # Check if processed files exist
         if (
             os.path.exists(self.processed_ratings_path)
@@ -46,7 +123,7 @@ class MovieDataProcessor:
             ratings_path = "ratings.csv"
 
         movies_df = self.process_movies_df()
-        ratings_df = pd.read_csv(f"{self.path}/{ratings_path}")
+        ratings_df = pd.read_csv(os.path.join(self.path, ratings_path))
         ratings_df = ratings_df[ratings_df["movieId"].isin(movies_df["movieId"])]
         ratings_df = pd.merge(
             ratings_df, movies_df["movieId"], on="movieId", how="left"
@@ -64,8 +141,9 @@ class MovieDataProcessor:
         )
 
         # Save processed files
-        movies_df.to_csv(self.processed_movies_path, index=False)
-        ratings_df.to_csv(self.processed_ratings_path, index=False)
+        if gnn_inference_path is None:
+            movies_df.to_csv(self.processed_movies_path, index=False)
+            ratings_df.to_csv(self.processed_ratings_path, index=False)
 
         return movies_df, ratings_df
 
@@ -112,85 +190,43 @@ class MovieDataProcessor:
     def standardize(x):
         return (x - x.mean()) / x.std()
 
-    def generate_user_features(self, ratings_df, movies_df):
-        merged_df = ratings_df.merge(movies_df, on="movieId")
-        user_avg_rating = merged_df.groupby("userId")["rating"].mean()
-
-        genre_dummies = merged_df["genres"].str.get_dummies("|")
-        genre_preference = merged_df.apply(
-            lambda row: row["rating"] * genre_dummies.loc[row.name], axis=1
+    def determine_preferred_genre(self, ratings_df, movies_df, unique_mappings):
+        merged_df = ratings_df.merge(movies_df[["movieId", "genres"]], on="movieId")
+        merged_df["genre"] = merged_df["genres"].str.split("|")
+        merged_df = merged_df.explode("genre")
+        genre_counts = (
+            merged_df.groupby(["userId", "genre"]).size().unstack(fill_value=0)
         )
-        user_genre_preference = genre_preference.groupby(merged_df["userId"]).sum()
-        user_genre_preference = user_genre_preference.div(
-            user_genre_preference.sum(axis=1), axis=0
+        genre_proportions = genre_counts.div(genre_counts.sum(axis=1), axis=0)
+
+        # Determine the preferred genre (where proportion > 0.5, if any)
+        preferred_genre = genre_proportions.apply(
+            lambda row: row.index[row > 0.5][0] if any(row > 0.5) else "None", axis=1
         )
+        all_users = pd.DataFrame(unique_mappings["user"])
+        complete_preferred_genre = all_users.merge(
+            preferred_genre.reset_index(),
+            left_on="userId",
+            right_on="userId",
+            how="left",
+        ).fillna("None")
 
-        # Compute other preferences
-        preferences = ["budget", "revenue", "vote_count"]
-        user_preferences = merged_df.groupby("userId").apply(
-            lambda x: pd.Series(
-                {
-                    f"{pref}_preference": (x["rating"] * x[pref]).sum()
-                    / x["rating"].sum()
-                    for pref in preferences
-                }
-            )
-        )
+        # Sort by mappedId to ensure correct order
+        complete_preferred_genre = complete_preferred_genre.sort_values("mappedId")
 
-        # Combine all features
-        user_features = pd.concat(
-            [
-                user_avg_rating.rename("avg_rating"),
-                user_genre_preference,
-                user_preferences,
-            ],
-            axis=1,
-        ).fillna(0)
+        genre_to_int = {
+            genre: i
+            for i, genre in enumerate(genre_proportions.columns.tolist() + ["None"])
+        }
+        preferred_genre_int = complete_preferred_genre[0].map(genre_to_int)
+        preferred_genre_tensor = torch.tensor(
+            preferred_genre_int.values, dtype=torch.float
+        ).unsqueeze(1)
 
-        # Normalize non-genre features
-        non_genre_columns = ["avg_rating"] + [
-            f"{pref}_preference" for pref in preferences
-        ]
-        user_features[non_genre_columns] = (
-            user_features[non_genre_columns] - user_features[non_genre_columns].mean()
-        ) / user_features[non_genre_columns].std()
+        return preferred_genre_tensor, genre_to_int
 
-        return user_features  # Return DataFrame with userId as index
-
-    def apply_user_features(self, test_ratings_df, train_user_features):
-        # Get unique users in the test set
-        test_users = test_ratings_df["userId"].unique()
-
-        # Create a DataFrame for test user features
-        test_user_features = pd.DataFrame(
-            index=test_users, columns=train_user_features.columns
-        )
-
-        # Fill in features for users that exist in the training set
-        common_users = test_user_features.index.intersection(train_user_features.index)
-        test_user_features.loc[common_users] = train_user_features.loc[common_users]
-
-        # For new users, use the mean of the training features
-        new_users = test_user_features.index.difference(train_user_features.index)
-        mean_features = train_user_features.mean()
-
-        # Only set mean features if there are new users
-        if len(new_users) > 0:
-            test_user_features.loc[new_users] = mean_features
-
-        # Add a flag for new users
-        test_user_features["is_new_user"] = 0
-        if len(new_users) > 0:
-            test_user_features.loc[new_users, "is_new_user"] = 1
-
-        # Fill NaN values with 0 (in case any remain)
-        test_user_features = test_user_features.fillna(0)
-
-        return test_user_features
-
-    def generate_movie_features(self, movies_df, ratings_df):
+    def read_movie_features(self, movies_df, ratings_df):
         movies_df = movies_df[movies_df["movieId"].isin(ratings_df["movieId"])]
-        genres = movies_df["genres"].str.get_dummies("|")
         numerical_features = ["vote_average", "revenue", "budget", "vote_count"]
         movies_df["vote_average"] = movies_df["vote_average"].fillna(5.0)
 
@@ -199,7 +235,6 @@ class MovieDataProcessor:
         num_features_standardized = self.standardize(num_features)
         num_tensors = torch.from_numpy(num_features_standardized).float()
         return num_tensors
-        # return torch.cat([torch.from_numpy(genres.values).float(), num_tensors], dim=1)
 
     def create_unique_id_mapping(self, df, column_name):
         unique_values = df[column_name].unique()
@@ -291,33 +326,74 @@ class MovieDataProcessor:
         movies_df,
         edge_index,
         unique_mappings,
-        user_features=None,
     ):
         data = HeteroData()
         data["user"].node_id = torch.arange(len(unique_mappings["user"]))
         data["movie"].node_id = torch.arange(len(unique_mappings["movie"]))
         data["director"].node_id = torch.arange(len(unique_mappings["director"]))
         data["genre"].node_id = torch.arange(len(unique_mappings["genre"]))
-        data["movie"].x = self.generate_movie_features(movies_df, ratings_df)
-        # data['user'].x = torch.tensor(user_features.values, dtype=torch.float)
+        data["movie"].x = self.read_movie_features(movies_df, ratings_df)
         data["user", "rates", "movie"].edge_index = edge_index["user_to_movie"]
         data["director", "directs", "movie"].edge_index = edge_index[
             "director_to_movie"
         ]
         data["genre", "is_genre", "movie"].edge_index = edge_index["genre_to_movie"]
         grouped_ratings = torch.from_numpy(ratings_df["grouped_rating"].values).long()
-        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=6).float()
+        one_hot_ratings = F.one_hot(grouped_ratings + 1, num_classes=7).float()
         data["user", "rates", "movie"].edge_attr = one_hot_ratings
         data["user", "rates", "movie"].edge_label = grouped_ratings
         data = T.ToUndirected()(data)
         return data
 
-    def generate_loaders(self, train_data, batch_size=2048, num_neighbors=[5, 5]):
+    def clean_ratings_df(self, ratings_df, val_data, test_data, unique_mappings):
+        def edge_index_to_df(edge_index, user_mapping, movie_mapping):
+            user_ids = (
+                user_mapping.set_index("mappedId")
+                .loc[edge_index[0].numpy(), "userId"]
+                .values
+            )
+            movie_ids = (
+                movie_mapping.set_index("mappedId")
+                .loc[edge_index[1].numpy(), "movieId"]
+                .values
+            )
+            return pd.DataFrame({"userId": user_ids, "movieId": movie_ids})
+
+        # Combine val and test edges
+        val_edges = edge_index_to_df(
+            val_data["user", "rates", "movie"].edge_label_index,
+            unique_mappings["user"],
+            unique_mappings["movie"],
+        )
+        test_edges = edge_index_to_df(
+            test_data["user", "rates", "movie"].edge_label_index,
+            unique_mappings["user"],
+            unique_mappings["movie"],
+        )
+
+        edges_to_remove = pd.concat([val_edges, test_edges], ignore_index=True)
+
+        # Use vectorized operations for filtering
+        ratings_array = ratings_df[["userId", "movieId"]].values
+        mask = ~np.isin(ratings_array, edges_to_remove.values).all(axis=1)
+        cleaned_ratings_df = ratings_df[mask]
+
+        return cleaned_ratings_df
+
+    def generate_loaders(
+        self,
+        train_data,
+        ratings_df,
+        unique_mappings,
+        movies_df,
+        batch_size=2048,
+        num_neighbors=[5, 5],
+    ):
         transform = T.RandomLinkSplit(
             num_val=0.1,
             num_test=0.1,
             disjoint_train_ratio=0.3,
-            neg_sampling_ratio=2.0,
+            neg_sampling_ratio=1.4,
             add_negative_train_samples=False,
             edge_types=[
                 ("user", "rates", "movie"),
@@ -332,6 +408,18 @@ class MovieDataProcessor:
             key="edge_label",
         )
         train_data, val_data, test_data = transform(train_data)
+
+        # generate user features only on training data, hence clean ratings_df
+        cleaned_ratings_df = self.clean_ratings_df(
+            ratings_df, val_data, test_data, unique_mappings
+        )
+        preferred_genre_tensor, _ = self.determine_preferred_genre(
+            cleaned_ratings_df, movies_df, unique_mappings
+        )
+        train_data["user"].x = preferred_genre_tensor
+        val_data["user"].x = preferred_genre_tensor
+        test_data["user"].x = preferred_genre_tensor
+
         create_loader = lambda data, batch_size=batch_size, shuffle=False, neg_sampling_ratio=0.0: LinkNeighborLoader(
             data,
             num_neighbors=num_neighbors,
@@ -344,10 +432,10 @@ class MovieDataProcessor:
             ),
             edge_label=data["user", "rates", "movie"].edge_label,
         )
-        train_loader = create_loader(train_data, shuffle=True, neg_sampling_ratio=2.0)
+        train_loader = create_loader(train_data, shuffle=True, neg_sampling_ratio=1.4)
         val_loader = create_loader(val_data, batch_size=batch_size)
         test_loader = create_loader(test_data, batch_size=batch_size)
-        return train_loader, val_loader, test_loader
+        return train_loader, val_loader, test_loader, train_data
 
     def discretize_features(self, movies_df, num_bins=5):
         features_to_discretize = ["budget", "revenue", "vote_average", "vote_count"]
@@ -579,20 +667,25 @@ def get_sageconv_movie_data_and_loaders(neighbors=[5, 5], batch_size=2048, small
         train_ratings_df,
         unique_mappings,
     ) = processor.process_data(ratings_df, movies_df)
-    train_data = processor.create_hetero_data(
+    data = processor.create_hetero_data(
         train_ratings_df,
         movies_df,
         edge_index,
         unique_mappings,
     )
-    train_loader, val_loader, test_loader = processor.generate_loaders(
-        train_data, batch_size=batch_size, num_neighbors=neighbors
+    train_loader, val_loader, test_loader, train_data = processor.generate_loaders(
+        data,
+        ratings_df,
+        unique_mappings,
+        movies_df,
+        batch_size=batch_size,
+        num_neighbors=neighbors,
     )
     return train_data, train_loader, val_loader, test_loader
 
 
 def get_gnn_inference_data(
-    inference_path, small=False, batch_size=1, num_neighbors=[10, 5, 5]
+    inference_path, small=False, batch_size=2048, num_neighbors=[15, 15, 15]
 ):
     processor = MovieDataProcessor(small)
     movies_df, ratings_df = processor.read_tmdb_movies()
@@ -611,11 +704,15 @@ def get_gnn_inference_data(
         edge_index,
         unique_mappings,
     )
+    preferred_genre_tensor, _ = processor.determine_preferred_genre(
+        full_ratings_df, movies_df, unique_mappings
+    )
+    data["user"].x = preferred_genre_tensor
 
     edge_index = processor.create_edge_index(
-        ratings_df,
+        inference_ratings_df,
         "userId",
-        ratings_df,
+        inference_ratings_df,
         "movieId",
         unique_mappings["user"],
         unique_mappings["movie"],
@@ -629,6 +726,6 @@ def get_gnn_inference_data(
             ("user", "rates", "movie"),
             edge_index,
         ),
-        edge_label=torch.full(edge_index[1].shape, 5),
+        edge_label=data["user", "rates", "movie"].edge_label,
     )
     return loader

@@ -1,4 +1,5 @@
 import csv
+import os
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -15,7 +16,6 @@ class KGEMovieRecommender:
         movie_mapping: Dict[int, int],
         director_mapping: Dict[int, int],
         genre_mapping: Dict[str, int],
-        node_info: Dict[str, int],
         data_processor: MovieDataProcessor,
     ):
         self.kge_model = kge_model.model
@@ -23,7 +23,6 @@ class KGEMovieRecommender:
         self.movie_mapping = movie_mapping
         self.director_mapping = director_mapping
         self.genre_mapping = genre_mapping
-        self.node_info = node_info
         self.data_processor = data_processor
 
         self.reverse_movie_mapping = {v: k for k, v in movie_mapping.items()}
@@ -32,12 +31,6 @@ class KGEMovieRecommender:
 
         self.num_entities = self.kge_model.node_emb.num_embeddings
         print(f"Number of entities in KGE model: {self.num_entities}")
-        print(f"Total nodes from processor: {self.node_info['total_nodes']}")
-
-        if self.num_entities != self.node_info["total_nodes"]:
-            raise ValueError(
-                "Mismatch between KGE model nodes and processed data nodes"
-            )
 
     def get_entity_embedding(self, entity_id: int) -> np.ndarray:
         if entity_id >= self.num_entities:
@@ -155,12 +148,27 @@ def load_coldstart_users(file_path: str) -> List[Dict[str, int]]:
     return users
 
 
-def main():
-    kge_model = MovieRecommendationModel.load_model(
-        "./model/model_transe_20240925_1618_acc0.8191.pt"
-    )
+def save_recommendations_to_csv(recommendations: List[Dict], output_file: str):
+    file_exists = os.path.isfile(output_file)
 
-    processor = MovieDataProcessor(small=False)
+    mode = "a" if file_exists else "w"
+    with open(output_file, mode, newline="") as csvfile:
+        fieldnames = ["userId", "movieId", "similarityScore"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        if not file_exists:
+            writer.writeheader()
+
+        for recommendation in recommendations:
+            writer.writerow(recommendation)
+
+
+def run_kge_inference(model_path=None):
+    if model_path is None:
+        model_path = "./model/model_transe_20240927_1953_acc0.8165.pt"
+    kge_model = MovieRecommendationModel.load_model(model_path)
+
+    processor = MovieDataProcessor()
     data = processor.process_data_kge()
     mappings = processor.get_mappings()
 
@@ -173,22 +181,30 @@ def main():
         movie_mapping,
         director_mapping,
         genre_mapping,
-        node_info,
         processor,
     )
 
-    # Load cold start users
     users = load_coldstart_users("./data/coldstart_users.csv")
+    all_recommendations = []
 
-    # Generate recommendations for each user
     for user in users:
-        print(f"\nRecommendations for user {user['userId']}:")
+        print(f"\nGenerating recommendations for user {user['userId']}:")
         recommendations = recommender.recommend_movies(
             user["likedMovieId"], user["likedDirectorId"], user["likedGenreId"]
         )
 
         for movie_id, score in recommendations:
-            print(f"Movie ID: {movie_id} (Similarity score: {score:.2f})")
+            movie_title = processor.get_movie_title(movie_id)
+            all_recommendations.append(
+                {
+                    "userId": user["userId"],
+                    "movieId": movie_id,
+                    "similarityScore": score,
+                }
+            )
+            print(
+                f"Movie ID: {movie_id} - Title: {movie_title} (Similarity score: {score:.2f})"
+            )
             print(
                 recommender.explain_recommendation(
                     movie_id,
@@ -199,6 +215,6 @@ def main():
             )
             print()
 
-
-if __name__ == "__main__":
-    main()
+    output_file = "./data/similarity_scores.csv"
+    save_recommendations_to_csv(all_recommendations, output_file)
+    print(f"\nRecommendations saved to {output_file}")

@@ -75,8 +75,9 @@ class EdgeSAGEConv(SAGEConv):
     def __init__(self, *args, edge_dim=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.edge_lin = nn.Linear(edge_dim, self.out_channels)
+        self._edge_attr = None
 
-    def forward(self, x, edge_index, edge_attr=None):
+    def forward(self, x, edge_index, size=None, edge_attr=None):
         if edge_attr is not None:
             self._edge_attr = edge_attr
         out = super().forward(x, edge_index)
@@ -100,7 +101,7 @@ class GNN(nn.Module):
 
     def forward(self, x, edge_index, edge_attr):
         for conv in self.convs:
-            x = conv(x, edge_index, edge_attr)
+            x = conv(x, edge_index, edge_attr=edge_attr)
             x = torch.relu(x)
         return x
 
@@ -134,19 +135,21 @@ class RecommendationModel(nn.Module):
         self.model_type = model_type
         self.data_info = data_info
 
-        self.movie_lin = nn.Linear(data_info["movie_feature_dim"], config["hidden_dim"])
         self.genre_emb = nn.Embedding(
             data_info["num_genre_nodes"], config["hidden_dim"]
         )
         self.user_emb = nn.Embedding(data_info["num_user_nodes"], config["hidden_dim"])
+        self.user_lin = nn.Linear(data_info["user_feature_dim"], config["hidden_dim"])
+
         self.director_emb = nn.Embedding(
             data_info["num_director_nodes"], config["hidden_dim"]
         )
         self.movie_emb = nn.Embedding(
             data_info["num_movie_nodes"], config["hidden_dim"]
         )
+        self.movie_lin = nn.Linear(data_info["movie_feature_dim"], config["hidden_dim"])
 
-        if self.model_type == "gnn":
+        if self.model_type == "sage":
             self.conv = GNN(
                 config["hidden_dim"],
                 config["hidden_dim"],
@@ -168,7 +171,7 @@ class RecommendationModel(nn.Module):
 
     def forward(self, data: HeteroData) -> Tensor:
         x_dict = {
-            "user": self.user_emb(data["user"].node_id),
+            "user": self.user_lin(data["user"].x) + self.user_emb(data["user"].node_id),
             "director": self.director_emb(data["director"].node_id),
             "genre": self.genre_emb(data["genre"].node_id),
             "movie": self.movie_lin(data["movie"].x)
@@ -252,10 +255,9 @@ def inference(model: nn.Module, input: DataLoader, device: torch.device):
         for batch in input:
             batch = batch.to(device)
             pred = model(batch)
-            probabilities = F.softmax(pred, dim=1)
-            movie_id = batch["user", "rates", "movie"]["edge_index"][1]
-            all_preds.append(probabilities.argmax(dim=1))
-    return all_preds
+            all_preds.append(F.softmax(pred, dim=1))
+    preds = torch.cat(all_preds, dim=0).argmax(dim=1)
+    return preds
 
 
 def compute_accuracy(labels: torch.Tensor, preds: torch.Tensor) -> float:
@@ -306,7 +308,7 @@ def train_gnn(
         train_losses.append(train_loss)
 
         # Validation
-        val_loss, val_accuracy = validate(model, val_loader, criterion, device)
+        _, val_accuracy = validate(model, val_loader, criterion, device)
         val_accuracies.append(val_accuracy)
 
         print(
@@ -326,7 +328,7 @@ def train_gnn(
 
 
 def print_rating_distribution(data):
-    ratings = data["user", "rates", "movie"].edge_attr.argmax(dim=1)
+    ratings = data["user", "rates", "movie"].edge_label  # .edge_attr.argmax(dim=1)
     unique, counts = torch.unique(ratings, return_counts=True)
     total = counts.sum().item()
     print("Rating distribution:")
@@ -348,34 +350,41 @@ def load_model(model_path: str, device: torch.device):
     return model, config, data_info
 
 
-def main():
-    config = {
-        "movie_feature_dim": 24,
-        "hidden_dim": 1024,
-        "num_layers": 1,
+def run_training(model_type="gat", small=False):
+    config_sageconv = {
+        "batch_size": 2048,
+        "movie_feature_dim": 4,
+        "user_feature_dim": 1,
+        "hidden_dim": 256,
+        "num_layers": 5,
         "edge_dim": 7,
         "learning_rate": 0.001,
         "epochs": 10,
-        "neighbors": [5, 5],
+        "neighbors": [15, 15, 15],
     }
 
     config_gat = {
         "batch_size": 2048,
         "movie_feature_dim": 4,
+        "user_feature_dim": 1,
         "hidden_dim": 256,
         "num_layers": 3,
-        "num_heads": 3,
-        "edge_dim": 6,
-        "learning_rate": 0.0001,
-        "epochs": 5,
-        "neighbors": [10, 5, 5],
+        "num_heads": 2,
+        "edge_dim": 7,
+        "learning_rate": 0.001,
+        "epochs": 10,
+        "neighbors": [15, 15, 15],
     }
+    if model_type == "gat":
+        config = config_gat
+    else:
+        config = config_sageconv
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data, train_loader, val_loader, test_loader = get_sageconv_movie_data_and_loaders(
-        batch_size=config_gat["batch_size"],
-        neighbors=config_gat["neighbors"],
-        small=False,
+        batch_size=config["batch_size"],
+        neighbors=config["neighbors"],
+        small=small,
     )
     print_rating_distribution(data)
 
@@ -385,22 +394,18 @@ def main():
         "num_director_nodes": data["director"].num_nodes,
         "num_genre_nodes": data["genre"].num_nodes,
         "movie_feature_dim": data["movie"].x.shape[1],
+        "user_feature_dim": data["user"].x.shape[1],
         "metadata": data.metadata(),
     }
 
-    # model = RecommendationModel(config_gat, data_info, "gat").to(device)
-    model, _, _ = load_model("./model/model_gat_20240923_1901_acc0.8952.pt", device)
+    model = RecommendationModel(config, data_info, model_type).to(device)
     trained_model, losses, accuracies = train_gnn(
         model,
         train_loader,
         val_loader,
         test_loader,
-        num_epochs=config_gat["epochs"],
-        lr=config_gat["learning_rate"],
+        num_epochs=config["epochs"],
+        lr=config["learning_rate"],
     )
 
     return trained_model, losses, accuracies
-
-
-if __name__ == "__main__":
-    main()
