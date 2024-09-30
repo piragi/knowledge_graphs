@@ -1,6 +1,7 @@
 # Movie Recommendation System
 
 This project implements a Movie Recommendation System using Graph Neural Networks (GNN) and Knowledge Graph Embeddings (KGE).
+Model files are located under "./model/", dataset and inference files are located under "./data/" and "./data/small" respectively.
 
 ## Installation
 
@@ -41,7 +42,7 @@ python main.py gnn_training [--small] [--model <sage|gat>]
 ```
 Example:
 ```
-python main.py gnn_training --model gat
+python main.py gnn_training --small --model gat
 ```
 
 ### GNN Inference
@@ -53,7 +54,7 @@ python main.py gnn_inference [--small] [--model_path <path_to_model>]
 
 Example:
 ```
-python main.py gnn_inference --model_path my_custom_gnn_model.pt
+python main.py gnn_inference --small --model_path ./model/my_custom_gnn_model.pt
 ```
 
 ### KGE Training
@@ -75,11 +76,22 @@ To run inference with a trained KGE model:
 python main.py kge_inference [--model_path <path_to_model>]
 ```
 
+## Contents
+- Inference data for the KGE approach to generate recommendations
+    - "./data/coldstart_users.csv"
+- Pre-generated inference data from a large GNN model (useful when hardware constraints prevent loading the full model)
+    - "./data/potential_ratings_user_9.csv"
+- Pre-trained model files for small versions of SAGEConv and GAT models
+    - "./model/model_transe_20240927_1953_acc0.8165.pt"
+    - "./model/model_complex_20240927_2003_acc0.7785.pt"
+    - "./model/model_rotate_20240927_1959_acc0.8111.pt"
+    - "./model/sage"
+    - "./model/gat"
 ## Additional Notes
 
-- The `--small` flag can be used with any command to use a smaller dataset, which is useful for testing or when computational resources are limited.
-- If no model is specified, the default model (GAT for GNN, TransE for KGE) will be used.
+- When training the big GNN models and hitting hardware constraints, try reducing the neighborhood parameter in the model.py and after that batch_size.
+- The `--small` flag can be used with any GNN commands to use a smaller dataset, which is useful for testing or when computational resources are limited.
+- If no model is specified, default models (GAT for GNN, TransE for KGE) will be used.
 - For inference, you can specify a custom model path using the `--model_path` argument. If not provided, default paths will be used.
-- Make sure you have the necessary datasets in place as specified by the program. The script mentions that no additional datasets need to be manually downloaded, so it should handle data preparation automatically.
+- No dataset downloads are needed, all will be downloaded and extracted automatically.
 
-Remember to run the script from the directory containing `main.py`. If you encounter any issues, make sure all dependencies are correctly installed and that you have the necessary computational resources (especially if using GPU-accelerated models).

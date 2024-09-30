@@ -255,9 +255,9 @@ def inference(model: nn.Module, input: DataLoader, device: torch.device):
         for batch in input:
             batch = batch.to(device)
             pred = model(batch)
-            probabilities = F.softmax(pred, dim=1)
-            all_preds.append(probabilities.argmax(dim=1))
-    return all_preds
+            all_preds.append(F.softmax(pred, dim=1))
+    preds = torch.cat(all_preds, dim=0).argmax(dim=1)
+    return preds
 
 
 def compute_accuracy(labels: torch.Tensor, preds: torch.Tensor) -> float:
@@ -328,7 +328,7 @@ def train_gnn(
 
 
 def print_rating_distribution(data):
-    ratings = data["user", "rates", "movie"].edge_attr.argmax(dim=1)
+    ratings = data["user", "rates", "movie"].edge_label  # .edge_attr.argmax(dim=1)
     unique, counts = torch.unique(ratings, return_counts=True)
     total = counts.sum().item()
     print("Rating distribution:")
@@ -357,10 +357,10 @@ def run_training(model_type="gat", small=False):
         "user_feature_dim": 1,
         "hidden_dim": 256,
         "num_layers": 5,
-        "edge_dim": 6,
+        "edge_dim": 7,
         "learning_rate": 0.001,
         "epochs": 10,
-        "neighbors": [10, 5, 5],
+        "neighbors": [15, 15, 15],
     }
 
     config_gat = {
@@ -370,10 +370,10 @@ def run_training(model_type="gat", small=False):
         "hidden_dim": 256,
         "num_layers": 3,
         "num_heads": 2,
-        "edge_dim": 6,
+        "edge_dim": 7,
         "learning_rate": 0.001,
         "epochs": 10,
-        "neighbors": [10, 5, 5],
+        "neighbors": [15, 15, 15],
     }
     if model_type == "gat":
         config = config_gat

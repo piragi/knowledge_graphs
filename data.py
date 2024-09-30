@@ -339,7 +339,7 @@ class MovieDataProcessor:
         ]
         data["genre", "is_genre", "movie"].edge_index = edge_index["genre_to_movie"]
         grouped_ratings = torch.from_numpy(ratings_df["grouped_rating"].values).long()
-        one_hot_ratings = F.one_hot(grouped_ratings, num_classes=6).float()
+        one_hot_ratings = F.one_hot(grouped_ratings + 1, num_classes=7).float()
         data["user", "rates", "movie"].edge_attr = one_hot_ratings
         data["user", "rates", "movie"].edge_label = grouped_ratings
         data = T.ToUndirected()(data)
@@ -393,7 +393,7 @@ class MovieDataProcessor:
             num_val=0.1,
             num_test=0.1,
             disjoint_train_ratio=0.3,
-            neg_sampling_ratio=2.0,
+            neg_sampling_ratio=1.4,
             add_negative_train_samples=False,
             edge_types=[
                 ("user", "rates", "movie"),
@@ -432,7 +432,7 @@ class MovieDataProcessor:
             ),
             edge_label=data["user", "rates", "movie"].edge_label,
         )
-        train_loader = create_loader(train_data, shuffle=True, neg_sampling_ratio=2.0)
+        train_loader = create_loader(train_data, shuffle=True, neg_sampling_ratio=1.4)
         val_loader = create_loader(val_data, batch_size=batch_size)
         test_loader = create_loader(test_data, batch_size=batch_size)
         return train_loader, val_loader, test_loader, train_data
@@ -685,7 +685,7 @@ def get_sageconv_movie_data_and_loaders(neighbors=[5, 5], batch_size=2048, small
 
 
 def get_gnn_inference_data(
-    inference_path, small=False, batch_size=1, num_neighbors=[10, 5, 5]
+    inference_path, small=False, batch_size=2048, num_neighbors=[15, 15, 15]
 ):
     processor = MovieDataProcessor(small)
     movies_df, ratings_df = processor.read_tmdb_movies()
